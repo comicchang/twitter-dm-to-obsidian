@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         Twitter DM to Obsidian
 // @namespace    https://github.com/user/twitter-dm-to-obsidian
-// @version      3.7.0
+// @version      3.8.0
 // @description  将 Twitter/X DM 消息（转发推文）批量导入 Obsidian，支持删除已载入消息
 // @author       user
 // @match        https://twitter.com/messages/*
 // @match        https://x.com/messages/*
 // @match        https://x.com/i/chat/*
 // @grant        GM_xmlhttpRequest
-// @connect      t.co
+// @connect      *
+// @connect      publish.twitter.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -17,8 +18,10 @@
 
   // ─── 用户配置（仅需修改这里）────────────────────────────────────────────────
   const CONFIG = {
-    vault:           '',  // Obsidian vault 名称（留空=使用当前已打开的 vault，填写后区分大小写）
-    dailyNoteFolder: '',  // Daily Note 子目录，空=根目录
+    vault:           '',        // Obsidian vault 名称（留空=使用当前已打开的 vault，填写后区分大小写）
+    dailyNoteFolder: '',        // Daily Note 子目录，空=根目录
+    writeMode:       'prepend', // 'prepend'=写在笔记开头；'append'=写在笔记末尾
+    debug:           false,     // true=写入 debug.md；false=追加到今日 Daily Note
   };
 
   // ─── DOM 选择器 ──────────────────────────────────────────────────────────────
@@ -44,52 +47,14 @@
 
   // 派发 hover 相关事件触发 React 渲染操作按钮（mouseover 需要冒泡以命中事件委托）
   function dispatchHoverEvents(el) {
-    const opts = { bubbles: true, cancelable: true, view: window };
+    // view: window 在 Tampermonkey 沙箱中会报错（沙箱 window 非真实 Window 对象），省略即可
+    const opts = { bubbles: true, cancelable: true };
     ['pointerover', 'mouseover', 'pointermove', 'mousemove'].forEach(t =>
       el.dispatchEvent(new MouseEvent(t, opts))
     );
     ['pointerenter', 'mouseenter'].forEach(t =>
       el.dispatchEvent(new MouseEvent(t, { ...opts, bubbles: false }))
     );
-  }
-
-  /**
-   * 点击所有 "Show more" 按钮展开截断文字（纯本地操作，无网络请求）
-   * 通过 React props.onClick 直接调用，比 .click() 更可靠
-   * 返回展开的按钮数量
-   */
-  async function expandShowMore() {
-    const spans = [...document.querySelectorAll('span')]
-      .filter(el => el.textContent.trim() === 'Show more');
-
-    for (const span of spans) {
-      const propsKey = Object.keys(span).find(k => k.startsWith('__reactProps'));
-      const onClick = propsKey && span[propsKey]?.onClick;
-      if (onClick) {
-        // React 合成事件要求有 preventDefault/stopPropagation 等方法
-        const noop = () => {};
-        onClick({
-          type: 'click',
-          target: span,
-          currentTarget: span,
-          bubbles: true,
-          cancelable: true,
-          preventDefault: noop,
-          stopPropagation: noop,
-          stopImmediatePropagation: noop,
-          persist: noop,
-          isDefaultPrevented: () => false,
-          isPropagationStopped: () => false,
-          nativeEvent: { preventDefault: noop, stopPropagation: noop },
-        });
-      } else {
-        span.click(); // fallback
-      }
-      await sleep(30);
-    }
-
-    if (spans.length > 0) await sleep(200); // 等待 React 重渲染
-    return spans.length;
   }
 
   // ─── t.co 短链展开 ──────────────────────────────────────────────────────────
@@ -106,11 +71,29 @@
     if (urlCache.has(url)) return urlCache.get(url);
 
     // GM_xmlhttpRequest 绕过 x.com 的 CSP connect-src 限制
+    // t.co 对非浏览器请求不做 HTTP 302，而是返回 200 + HTML（JS redirect）
+    // 解析 <a id="l" href="...">（t.co 标准锚点）提取真实 URL；meta refresh 作备选
     function gmExpand(u) {
       return new Promise(resolve => {
         GM_xmlhttpRequest({
-          method: 'HEAD', url: u,
-          onload:  r => resolve(r.finalUrl || u),
+          method: 'GET', url: u,
+          headers: { 'User-Agent': navigator.userAgent },
+          onload: r => {
+            // 若 HTTP 层发生了真实重定向（部分环境下有效）
+            const httpFinal = r.finalUrl || r.responseURL;
+            if (httpFinal && httpFinal !== u) return resolve(httpFinal);
+            // 解析 t.co 返回的 HTML
+            try {
+              const doc = new DOMParser().parseFromString(r.responseText, 'text/html');
+              const anchor = doc.querySelector('a#l');
+              if (anchor?.href) return resolve(anchor.href);
+              const meta = doc.querySelector('meta[http-equiv="refresh"]');
+              const content = meta?.getAttribute('content') || '';
+              const m = content.match(/url=['"]?([^'">\s]+)/i);
+              if (m) return resolve(m[1]);
+            } catch {}
+            resolve(u);
+          },
           onerror: () => resolve(u),
         });
       });
@@ -145,14 +128,94 @@
       await Promise.all(tcoUrls.slice(i, i + BATCH).map(u => expandTcoUrl(u)));
     }
 
-    // 用缓存结果替换 extraLinks 中的 href
-    return messages.map(msg => ({
-      ...msg,
-      extraLinks: (msg.extraLinks || []).map(link => ({
+    // 用缓存结果替换 extraLinks 中的 href，并按最终 URL 去重（DOM + oEmbed 来源可能重叠）
+    return messages.map(msg => {
+      const expanded = (msg.extraLinks || []).map(link => ({
         ...link,
         href: urlCache.get(link.href) ?? link.href,
-      })),
-    }));
+      }));
+      const seen = new Set();
+      return {
+        ...msg,
+        extraLinks: expanded.filter(l => seen.has(l.href) ? false : seen.add(l.href)),
+      };
+    });
+  }
+
+  // ─── oEmbed 补全 ─────────────────────────────────────────────────────────────
+  //
+  // DM 卡片只渲染推文预览，正文内的链接（t.co）可能不出现在卡片 DOM 里。
+  // 通过 publish.twitter.com/oembed 获取推文完整 HTML，展开 t.co 后更新正文文字。
+
+  /**
+   * 获取单条推文 oEmbed 的 blockquote <p> 元素及其中的 t.co 链接列表
+   * 返回 { p: Element, tcoLinks: string[] } 或 null
+   */
+  async function fetchOembedData(tweetUrl) {
+    return new Promise(resolve => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: `https://publish.twitter.com/oembed?url=${encodeURIComponent(tweetUrl)}&omit_script=true`,
+        onload: r => {
+          // 4xx：推文已删除 / 不可见 / 账号停用，标记为 notFound 供调用方过滤
+          if (r.status >= 400 && r.status < 500) return resolve({ notFound: true });
+          try {
+            const { html } = JSON.parse(r.responseText);
+            const tmp = document.createElement('div');
+            tmp.innerHTML = html;
+            const p = tmp.querySelector('blockquote p');
+            if (!p) return resolve(null);
+            const tcoLinks = [...p.querySelectorAll('a[href]')]
+              .map(a => a.href)
+              .filter(h => h.includes('t.co/'));
+            resolve({ p, tcoLinks });
+          } catch {
+            resolve(null);
+          }
+        },
+        onerror: () => resolve(null),
+      });
+    });
+  }
+
+  /**
+   * 用 oEmbed 数据更新每条推文的正文（批量并发 3）：
+   * - t.co 链接从正文中移除，加入 extraLinks 由 resolveExtraLinks 统一展开
+   * - @mention / #hashtag 保留为纯文字
+   * 返回新数组，不修改原对象
+   */
+  async function enrichWithOembed(messages) {
+    const BATCH = 3;
+    const result = messages.map(m => ({ ...m, extraLinks: [...(m.extraLinks || [])] }));
+    const tweetItems = result.filter(m => m.url);
+
+    for (let i = 0; i < tweetItems.length; i += BATCH) {
+      await Promise.all(tweetItems.slice(i, i + BATCH).map(async msg => {
+        const data = await fetchOembedData(msg.url);
+        if (!data) return;               // 网络错误：保留原始数据
+        if (data.notFound) { msg._skip = true; return; } // 推文已失效：标记跳过
+
+        const { p, tcoLinks } = data;
+
+        // t.co <a> → 从文字中移除；其余 <a>（@mention/#hashtag）→ 保留显示文字
+        for (const a of [...p.querySelectorAll('a[href]')]) {
+          a.replaceWith(document.createTextNode(
+            a.href.includes('t.co/') ? '' : a.textContent
+          ));
+        }
+
+        // 更新正文（多余空格合并）
+        const cleaned = p.textContent.replace(/\s+/g, ' ').trim();
+        if (cleaned) msg.text = cleaned;
+
+        // t.co 链接加入 extraLinks，交由 resolveExtraLinks 展开后统一去重
+        for (const href of tcoLinks) {
+          msg.extraLinks.push({ href, label: '' });
+        }
+      }));
+    }
+
+    return result.filter(m => !m._skip);
   }
 
   // ─── 消息提取 ────────────────────────────────────────────────────────────────
@@ -298,11 +361,8 @@
       return;
     }
 
-    // 展开所有截断的推文正文
-    btn.textContent = '⏳ 展开中...';
+    btn.textContent = '⏳ 抓取中...';
     btn.disabled = true;
-    const expanded = await expandShowMore();
-    if (expanded > 0) console.log(`[DM→Obsidian] 展开了 ${expanded} 个 Show more`);
 
     let messages = scrapeLoadedMessages();
     if (!messages.length) {
@@ -312,7 +372,14 @@
       return;
     }
 
-    // 展开 t.co 短链（如 CORS 阻断则静默保留原始链接）
+    // oEmbed：获取完整推文正文并展开正文内 t.co 链接
+    const tweetCount = messages.filter(m => m.url).length;
+    if (tweetCount > 0) {
+      btn.textContent = `⏳ 抓取推文 (${tweetCount})...`;
+      messages = await enrichWithOembed(messages);
+    }
+
+    // 展开卡片 DOM 里剩余的 t.co 短链（链接预览卡等）
     const tcoCount = messages.reduce((n, m) => n + (m.extraLinks || []).filter(l => l.href.includes('t.co/')).length, 0);
     if (tcoCount > 0) {
       btn.textContent = `⏳ 展开链接 (${tcoCount})...`;
@@ -322,10 +389,13 @@
     const markdown = formatMarkdown(messages);
 
     // 用 encodeURIComponent 构造 URI，避免 URLSearchParams 把空格编为 +
+    // debug=true 时写入 debug.md，否则追加到今日 Daily Note
     const buildUri = (data) => {
-      let u = `obsidian://advanced-uri?daily=true&mode=append&data=${encodeURIComponent(data)}`;
+      const target = CONFIG.debug
+        ? `filepath=debug.md`
+        : `daily=true${CONFIG.dailyNoteFolder ? `&dailyNotePath=${encodeURIComponent(CONFIG.dailyNoteFolder)}` : ''}`;
+      let u = `obsidian://advanced-uri?${target}&mode=${CONFIG.writeMode}&data=${encodeURIComponent(data)}`;
       if (CONFIG.vault) u += `&vault=${encodeURIComponent(CONFIG.vault)}`;
-      if (CONFIG.dailyNoteFolder) u += `&dailyNotePath=${encodeURIComponent(CONFIG.dailyNoteFolder)}`;
       return u;
     };
 
@@ -357,72 +427,105 @@
    * 删除单条消息（hover → 操作按钮 → Delete → 确认）
    * ⚠️ 依赖 React 响应 JS 派发的鼠标事件，可能失效
    */
-  async function deleteSingleMessage(liEl, msgEl) {
+  async function deleteSingleMessage(liEl, msgEl, label) {
     liEl.scrollIntoView({ block: 'center', behavior: 'instant' });
-    await sleep(120);
+    await sleep(500);
 
     dispatchHoverEvents(msgEl);
-    await sleep(350);
+    await sleep(700);
 
     const actionsDiv = msgEl.querySelector(SEL.actionsArea);
-    if (!actionsDiv) return false;
+    if (!actionsDiv) {
+      console.warn('[delete]', label, '→ actionsDiv 未出现（hover 未触发）');
+      return false;
+    }
 
     const btns = actionsDiv.querySelectorAll('button');
-    if (!btns.length) return false;
+    if (!btns.length) {
+      console.warn('[delete]', label, '→ actionsDiv 内无按钮');
+      return false;
+    }
 
-    // 点击最后一个按钮（通常是 "..." 更多操作）
+    // 点击最后一个按钮（"..." 更多操作）
     btns[btns.length - 1].click();
-    await sleep(300);
 
-    // 在浮动菜单中找 Delete/删除
+    // 轮询等待 Radix Popover 内的删除按钮出现（最多 1.5s）
     let deleteItem = null;
-    for (const item of document.querySelectorAll('[role="menuitem"]')) {
-      const t = item.textContent.trim().toLowerCase();
-      if (t === 'delete' || t === '删除') { deleteItem = item; break; }
+    for (let t = 0; t < 10 && !deleteItem; t++) {
+      await sleep(150);
+      deleteItem = document.querySelector(
+        '[data-testid="action-menu-item-delete-for-me"],' +
+        '[data-testid="action-menu-item-delete"],' +
+        '[data-testid="action-menu-item-delete-for-everyone"]'
+      );
     }
 
     if (!deleteItem) {
+      console.warn('[delete]', label, '→ 未找到删除按钮（Radix Popover 未出现或结构变化）');
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-      await sleep(100);
+      await sleep(300);
       return false;
     }
 
     deleteItem.click();
-    await sleep(300);
 
-    // 处理二次确认弹窗（如有）
-    for (const btn of document.querySelectorAll('[role="dialog"] button, [role="alertdialog"] button')) {
-      const t = btn.textContent.trim().toLowerCase();
-      if (t === 'delete' || t === '删除' || t === 'confirm') {
-        btn.click();
-        await sleep(200);
-        return true;
-      }
+    // 轮询等待确认弹窗出现（最多 1.5s）
+    // 确认按钮是 type="submit"，取消按钮是 type="button"
+    let confirmBtn = null;
+    for (let t = 0; t < 10 && !confirmBtn; t++) {
+      await sleep(150);
+      confirmBtn = document.querySelector(
+        '[role="dialog"] button[type="submit"], [role="alertdialog"] button[type="submit"]'
+      );
+    }
+    if (confirmBtn) {
+      console.log('[delete]', label, '→ 点击确认弹窗:', confirmBtn.textContent.trim());
+      confirmBtn.click();
+      await sleep(500);
+      return true;
     }
 
-    return true; // 无二次确认弹窗视为成功
+    console.log('[delete]', label, '→ 成功（无确认弹窗）');
+    return true;
   }
 
   async function deleteAllMessages(deleteBtn) {
-    const messages = scrapeLoadedMessages();
-    if (!messages.length) {
+    const initial = scrapeLoadedMessages();
+    if (!initial.length) {
       alert('未找到已载入的消息');
       return;
     }
 
     if (!window.confirm(
-      `确认删除已载入的 ${messages.length} 条消息？\n\n` +
+      `确认删除已载入的 ${initial.length} 条消息？\n\n` +
       `⚠️ 不可撤销，仅删除你这侧的记录。\n` +
       `⚠️ 若失败率高，请手动删除（删除功能依赖鼠标 hover 触发）。`
     )) return;
 
     deleteBtn.disabled = true;
     let success = 0, fail = 0;
+    const total = initial.length;
+    // 从下往上删：底部消息先删，顶部消息留在视口内不被回收
+    const pending = [...initial].reverse().map(m => m.url || m.text);
 
-    for (const { liEl, msgEl } of messages) {
-      if (!document.contains(liEl)) continue;
-      deleteBtn.textContent = `⏳ ${success + fail + 1}/${messages.length}`;
-      await deleteSingleMessage(liEl, msgEl) ? success++ : fail++;
+    console.log('[delete] 开始删除，共', total, '条');
+
+    for (const key of pending) {
+      // 重新抓取，找到与 key 匹配的当前 DOM 节点
+      const current = scrapeLoadedMessages().find(m => (m.url || m.text) === key);
+      if (!current || !document.contains(current.liEl)) {
+        console.warn('[delete] 不在 DOM，跳过:', key?.slice(0, 60));
+        continue;
+      }
+
+      const label = `[${success + fail + 1}/${total}] ${key?.slice(0, 60)}`;
+      deleteBtn.textContent = `⏳ ${success + fail + 1}/${total}`;
+
+      const ok = await deleteSingleMessage(current.liEl, current.msgEl, label);
+      console.log('[delete]', label, ok ? '✅ 成功' : '❌ 失败');
+      ok ? success++ : fail++;
+
+      await sleep(500); // 等待 DOM 更新
     }
 
     deleteBtn.disabled = false;
@@ -472,8 +575,9 @@
     const container = moreBtn.parentElement;
     if (!container) return;
 
-    const exportBtn = makeBtn('obsidian-export-btn', '📥 Obsidian', '#7c3aed', '#6d28d9');
-    exportBtn.title = '将已载入消息保存到 Obsidian Daily Note';
+    const exportLabel = CONFIG.debug ? '📥 Obsidian [D]' : '📥 Obsidian';
+    const exportBtn = makeBtn('obsidian-export-btn', exportLabel, '#7c3aed', '#6d28d9');
+    exportBtn.title = CONFIG.debug ? '调试模式：写入 debug.md' : '将已载入消息保存到 Obsidian Daily Note';
     exportBtn.addEventListener('click', () => exportToObsidian(exportBtn));
 
     const deleteBtn = makeBtn('obsidian-delete-btn', '🗑️ 删除已载入', '#dc2626', '#b91c1c');
