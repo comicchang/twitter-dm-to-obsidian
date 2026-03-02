@@ -30,8 +30,8 @@ Advanced URI 安装：Obsidian → 设置 → 社区插件 → 浏览 → 搜索
 
 1. 安装 Tampermonkey 浏览器扩展
 2. 点击 Tampermonkey 图标 → **新建脚本**
-3. 将 `twitter-dm-to-obsidian.user.js` 的全部内容粘贴进去
-4. `Ctrl/Cmd + S` 保存，允许 `t.co` 域名访问权限
+3. 将 `twitter-dm-to-obsidian.user.js` 的全部内容粘贴进去，或直接访问 [Raw 链接](https://raw.githubusercontent.com/comicchang/twitter-dm-to-obsidian/main/twitter-dm-to-obsidian.user.js) 安装
+4. `Ctrl/Cmd + S` 保存，允许所有域名访问权限（用于展开 t.co 短链）
 
 ---
 

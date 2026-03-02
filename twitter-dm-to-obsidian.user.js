@@ -1,9 +1,12 @@
 // ==UserScript==
 // @name         Twitter DM to Obsidian
-// @namespace    https://github.com/user/twitter-dm-to-obsidian
+// @namespace    https://github.com/comicchang/twitter-dm-to-obsidian
 // @version      3.8.0
 // @description  将 Twitter/X DM 消息（转发推文）批量导入 Obsidian，支持删除已载入消息
-// @author       user
+// @author       comicchang
+// @homepageURL  https://github.com/comicchang/twitter-dm-to-obsidian
+// @updateURL    https://raw.githubusercontent.com/comicchang/twitter-dm-to-obsidian/main/twitter-dm-to-obsidian.user.js
+// @downloadURL  https://raw.githubusercontent.com/comicchang/twitter-dm-to-obsidian/main/twitter-dm-to-obsidian.user.js
 // @match        https://twitter.com/messages/*
 // @match        https://x.com/messages/*
 // @match        https://x.com/i/chat/*
