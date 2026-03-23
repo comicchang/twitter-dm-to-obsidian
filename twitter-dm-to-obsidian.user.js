@@ -325,6 +325,30 @@
     return result;
   }
 
+  function getTweetStatusId(url) {
+    const match = url?.match(/\/status\/(\d+)/);
+    return match ? BigInt(match[1]) : null;
+  }
+
+  // 导出时优先按 tweet status id 排序；这是 snowflake，数值越大通常越新。
+  // 没有 status id 的纯文字消息，再按页面中的实际位置排序兜底。
+  function sortMessagesForExport(messages) {
+    return [...messages].sort((a, b) => {
+      const aStatusId = getTweetStatusId(a.url);
+      const bStatusId = getTweetStatusId(b.url);
+      if (aStatusId !== null && bStatusId !== null && aStatusId !== bStatusId) {
+        return aStatusId > bStatusId ? -1 : 1;
+      }
+      if (aStatusId !== null && bStatusId === null) return -1;
+      if (aStatusId === null && bStatusId !== null) return 1;
+
+      const aTop = a.liEl?.getBoundingClientRect?.().top ?? 0;
+      const bTop = b.liEl?.getBoundingClientRect?.().top ?? 0;
+      if (aTop !== bTop) return bTop - aTop;
+      return 0;
+    });
+  }
+
   // ─── Markdown 格式化 ──────────────────────────────────────────────────────────
   //
   // 输出格式（无 header/footer）：
@@ -575,7 +599,7 @@
     btn.textContent = '⏳ 抓取中...';
     btn.disabled = true;
 
-    let messages = scrapeLoadedMessages();
+    let messages = sortMessagesForExport(scrapeLoadedMessages());
     const skippedDeletedTweetKeys = [];
     if (!messages.length) {
       btn.textContent = '📥 Obsidian';
