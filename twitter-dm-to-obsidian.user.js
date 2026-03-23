@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter DM to Obsidian
 // @namespace    https://github.com/comicchang/twitter-dm-to-obsidian
-// @version      3.8.0
+// @version      3.8.1
 // @description  将 Twitter/X DM 消息（转发推文）批量导入 Obsidian，支持删除已载入消息
 // @author       comicchang
 // @homepageURL  https://github.com/comicchang/twitter-dm-to-obsidian
@@ -301,7 +301,16 @@
       const msgEl = li.querySelector(SEL.messageItem);
       if (!msgEl) continue;
       const data = parseMessage(msgEl);
-      if (data) result.push({ liEl: li, msgEl, ...data });
+      if (!data) continue;
+
+      // 消息唯一键：优先使用 Twitter 内部 message-* id，其次回退到 URL/文本
+      const testId = msgEl.getAttribute('data-testid') || '';
+      const idPart = testId.startsWith('message-') ? testId.slice('message-'.length) : '';
+      const messageKey = idPart
+        ? `id:${idPart}`
+        : (data.url ? `url:${data.url}` : `text:${data.text}`);
+
+      result.push({ liEl: li, msgEl, messageKey, ...data });
     }
     return result;
   }
@@ -355,9 +364,108 @@
 
   // ─── Obsidian URI 导出 ────────────────────────────────────────────────────────
 
-  const URI_MAX = 8000;
+  // 实测浏览器/Obsidian 链路对超长 custom URI 比脚本内字符串长度更敏感，
+  // 阈值保守一些，避免传输途中被截断后留下半个 %xx 导致 URI malformed。
+  const URI_MAX = 7400;
+  const URI_SOFT_MAX = 7000;
+  // 安全门禁：每个会话记录“已导出过的消息 key”
+  const exportedMessageKeysByConversation = new Map();
 
-  async function exportToObsidian(btn) {
+  // 当前会话 key：/messages/{id} 或 /i/chat/{id}
+  function getCurrentConversationKey() {
+    const m = window.location.pathname.match(/^\/(?:messages|i\/chat)\/[^/]+/);
+    return m ? m[0] : '';
+  }
+
+  function getExportedMessageSetForCurrentConversation(create = false) {
+    const key = getCurrentConversationKey();
+    if (!key) return null;
+    let set = exportedMessageKeysByConversation.get(key);
+    if (!set && create) {
+      set = new Set();
+      exportedMessageKeysByConversation.set(key, set);
+    }
+    return set || null;
+  }
+
+  function hasExportedCurrentConversation() {
+    const set = getExportedMessageSetForCurrentConversation(false);
+    return !!set && set.size > 0;
+  }
+
+  function isMessageExported(messageKey) {
+    const set = getExportedMessageSetForCurrentConversation(false);
+    return !!set && set.has(messageKey);
+  }
+
+  function markMessagesExported(messageKeys) {
+    const set = getExportedMessageSetForCurrentConversation(true);
+    if (!set) return;
+    for (const key of messageKeys) set.add(key);
+  }
+
+  function unmarkMessageExported(messageKey) {
+    const set = getExportedMessageSetForCurrentConversation(false);
+    if (!set) return;
+    set.delete(messageKey);
+  }
+
+  // 根据安全门禁刷新删除按钮状态
+  function syncDeleteGuard(deleteBtn) {
+    const canDelete = hasExportedCurrentConversation();
+    deleteBtn.disabled = !canDelete;
+    deleteBtn.style.opacity = canDelete ? '1' : '0.65';
+    deleteBtn.style.cursor = canDelete ? 'pointer' : 'not-allowed';
+    deleteBtn.title = canDelete
+      ? '仅删除当前已载入且已导出过的消息（不可撤销）'
+      : '安全检查：请先导出当前会话，删除只会作用于已导出消息';
+  }
+
+  // Advanced URI 在不同宿主链路里可能被提前解码一次。
+  // 这里统一做双层 encode，保证传到插件 decodeURIComponent 后仍能还原原文。
+  function encodeAdvancedUriValue(value) {
+    return encodeURIComponent(encodeURIComponent(value));
+  }
+
+  // 用 encodeURIComponent 构造 URI，避免 URLSearchParams 把空格编为 +
+  // debug=true 时写入 debug.md，否则追加到今日 Daily Note
+  function buildObsidianUri(data) {
+    const target = CONFIG.debug
+      ? `filepath=${encodeAdvancedUriValue('debug.md')}`
+      : `daily=true${CONFIG.dailyNoteFolder ? `&dailyNotePath=${encodeAdvancedUriValue(CONFIG.dailyNoteFolder)}` : ''}`;
+    let u = `obsidian://advanced-uri?${target}&mode=${CONFIG.writeMode}&data=${encodeAdvancedUriValue(data)}`;
+    if (CONFIG.vault) u += `&vault=${encodeAdvancedUriValue(CONFIG.vault)}`;
+    return u;
+  }
+
+  // 只选择“从前往后”能安全装进单次导出的消息前缀。
+  // 超限后立即停止，剩余消息留给下一轮导出，避免一次触发多次 URI 调用。
+  function takeExportableMessagePrefix(messages) {
+    const selected = [];
+
+    for (const msg of messages) {
+      const next = [...selected, msg];
+      const nextUri = buildObsidianUri('\n' + formatMarkdown(next));
+      if (nextUri.length <= URI_SOFT_MAX) {
+        selected.push(msg);
+        continue;
+      }
+
+      const singleUri = buildObsidianUri('\n' + formatMarkdown([msg]));
+      if (!selected.length && singleUri.length > URI_SOFT_MAX) {
+        return { selected: [], remaining: messages, blockedBySingleOversize: true };
+      }
+      break;
+    }
+
+    return {
+      selected,
+      remaining: messages.slice(selected.length),
+      blockedBySingleOversize: false,
+    };
+  }
+
+  async function exportToObsidian(btn, deleteBtn) {
     const ul = document.querySelector(`${SEL.messageList} ul`);
     if (!ul) {
       alert('未找到消息列表，请确认已打开一个 DM 对话');
@@ -389,38 +497,42 @@
       messages = await resolveExtraLinks(messages);
     }
 
-    const markdown = formatMarkdown(messages);
-
-    // 用 encodeURIComponent 构造 URI，避免 URLSearchParams 把空格编为 +
-    // debug=true 时写入 debug.md，否则追加到今日 Daily Note
-    const buildUri = (data) => {
-      const target = CONFIG.debug
-        ? `filepath=debug.md`
-        : `daily=true${CONFIG.dailyNoteFolder ? `&dailyNotePath=${encodeURIComponent(CONFIG.dailyNoteFolder)}` : ''}`;
-      let u = `obsidian://advanced-uri?${target}&mode=${CONFIG.writeMode}&data=${encodeURIComponent(data)}`;
-      if (CONFIG.vault) u += `&vault=${encodeURIComponent(CONFIG.vault)}`;
-      return u;
-    };
-
-    let dataStr = '\n' + markdown;
-    let uri = buildUri(dataStr);
-
-    if (uri.length > URI_MAX) {
-      alert(`内容超过 ${URI_MAX} 字符（共 ${messages.length} 条），将截断导出。`);
-      // 每次削减 100 字符直到满足长度上限
-      while (uri.length > URI_MAX && dataStr.length > 100) {
-        dataStr = dataStr.slice(0, dataStr.length - 100);
-        uri = buildUri(dataStr);
-      }
+    const { selected, remaining, blockedBySingleOversize } = takeExportableMessagePrefix(messages);
+    if (!selected.length) {
+      btn.textContent = '📥 Obsidian';
+      btn.disabled = false;
+      alert(
+        blockedBySingleOversize
+          ? `未能导出：当前最前面的消息单条已超过 URI 安全上限（${URI_SOFT_MAX}）。`
+          : '未找到可导出的消息内容'
+      );
+      return;
     }
 
-    btn.textContent = '⏳ 导出中...';
+    const uri = buildObsidianUri('\n' + formatMarkdown(selected));
+    if (uri.length > URI_MAX) {
+      btn.textContent = '📥 Obsidian';
+      btn.disabled = false;
+      alert(`未能导出：消息过长，单次导出已超过 URI 上限（${URI_MAX}）。`);
+      return;
+    }
+
+    btn.textContent = `⏳ 导出 ${selected.length} 条...`;
     window.location.href = uri;
+    markMessagesExported(selected.map(m => m.messageKey));
 
     setTimeout(() => {
-      btn.textContent = '✅ 已导出';
+      if (deleteBtn && document.contains(deleteBtn)) syncDeleteGuard(deleteBtn);
+      btn.textContent = `✅ 已导出 ${selected.length} 条`;
       btn.disabled = false;
-      setTimeout(() => { btn.textContent = '📥 Obsidian'; }, 2000);
+      if (remaining.length > 0) {
+        alert(
+          `本次已归档前 ${selected.length} 条消息。` +
+          `\n其余 ${remaining.length} 条因长度限制保留在当前列表。` +
+          `\n删除时只会删除这次已归档到 Obsidian 的消息。`
+        );
+      }
+      setTimeout(() => { btn.textContent = '📥 Obsidian'; }, 3500);
     }, 1000);
   }
 
@@ -493,40 +605,53 @@
   }
 
   async function deleteAllMessages(deleteBtn) {
-    const initial = scrapeLoadedMessages();
+    if (!hasExportedCurrentConversation()) {
+      syncDeleteGuard(deleteBtn);
+      alert('安全检查未通过：请先导出当前会话。');
+      return;
+    }
+
+    const initial = scrapeLoadedMessages().filter(m => isMessageExported(m.messageKey));
     if (!initial.length) {
-      alert('未找到已载入的消息');
+      syncDeleteGuard(deleteBtn);
+      alert('未找到“已载入且已导出”的消息。');
       return;
     }
 
     if (!window.confirm(
-      `确认删除已载入的 ${initial.length} 条消息？\n\n` +
+      `确认删除已载入且已导出的 ${initial.length} 条消息？\n\n` +
       `⚠️ 不可撤销，仅删除你这侧的记录。\n` +
-      `⚠️ 若失败率高，请手动删除（删除功能依赖鼠标 hover 触发）。`
+      `⚠️ 未导出的消息不会被删除。`
     )) return;
 
     deleteBtn.disabled = true;
     let success = 0, fail = 0;
     const total = initial.length;
     // 从下往上删：底部消息先删，顶部消息留在视口内不被回收
-    const pending = [...initial].reverse().map(m => m.url || m.text);
+    const pending = [...initial].reverse().map(m => m.messageKey);
 
     console.log('[delete] 开始删除，共', total, '条');
 
     for (const key of pending) {
       // 重新抓取，找到与 key 匹配的当前 DOM 节点
-      const current = scrapeLoadedMessages().find(m => (m.url || m.text) === key);
+      const current = scrapeLoadedMessages().find(m => m.messageKey === key);
       if (!current || !document.contains(current.liEl)) {
         console.warn('[delete] 不在 DOM，跳过:', key?.slice(0, 60));
         continue;
       }
 
-      const label = `[${success + fail + 1}/${total}] ${key?.slice(0, 60)}`;
+      const preview = (current.url || current.text || key || '').slice(0, 60);
+      const label = `[${success + fail + 1}/${total}] ${preview}`;
       deleteBtn.textContent = `⏳ ${success + fail + 1}/${total}`;
 
       const ok = await deleteSingleMessage(current.liEl, current.msgEl, label);
       console.log('[delete]', label, ok ? '✅ 成功' : '❌ 失败');
-      ok ? success++ : fail++;
+      if (ok) {
+        success++;
+        unmarkMessageExported(key);
+      } else {
+        fail++;
+      }
 
       await sleep(500); // 等待 DOM 更新
     }
@@ -540,7 +665,10 @@
       alert(`${success} 条成功，${fail} 条失败。\n请手动删除剩余消息。`);
     }
 
-    setTimeout(() => { deleteBtn.textContent = '🗑️ 删除已载入'; }, 4000);
+    setTimeout(() => {
+      deleteBtn.textContent = '🗑️ 删除已载入';
+      syncDeleteGuard(deleteBtn);
+    }, 4000);
   }
 
   // ─── 按钮注入 ────────────────────────────────────────────────────────────────
@@ -570,7 +698,15 @@
 
   function tryInjectButtons() {
     if (!/\/messages\/.+|\/i\/chat\/.+/.test(window.location.pathname)) return;
-    if (document.getElementById('obsidian-export-btn')) return;
+    const existingExportBtn = document.getElementById('obsidian-export-btn');
+    const existingDeleteBtn = document.getElementById('obsidian-delete-btn');
+    if (existingExportBtn && existingDeleteBtn) {
+      syncDeleteGuard(existingDeleteBtn);
+      return;
+    }
+    // 避免只残留单个按钮导致状态错乱
+    existingExportBtn?.remove();
+    existingDeleteBtn?.remove();
 
     const moreBtn = document.querySelector(SEL.moreBtn);
     if (!moreBtn) return;
@@ -578,14 +714,14 @@
     const container = moreBtn.parentElement;
     if (!container) return;
 
+    const deleteBtn = makeBtn('obsidian-delete-btn', '🗑️ 删除已载入', '#dc2626', '#b91c1c');
+    syncDeleteGuard(deleteBtn);
+    deleteBtn.addEventListener('click', () => deleteAllMessages(deleteBtn));
+
     const exportLabel = CONFIG.debug ? '📥 Obsidian [D]' : '📥 Obsidian';
     const exportBtn = makeBtn('obsidian-export-btn', exportLabel, '#7c3aed', '#6d28d9');
     exportBtn.title = CONFIG.debug ? '调试模式：写入 debug.md' : '将已载入消息保存到 Obsidian Daily Note';
-    exportBtn.addEventListener('click', () => exportToObsidian(exportBtn));
-
-    const deleteBtn = makeBtn('obsidian-delete-btn', '🗑️ 删除已载入', '#dc2626', '#b91c1c');
-    deleteBtn.title = '逐条删除已载入的消息（不可撤销）';
-    deleteBtn.addEventListener('click', () => deleteAllMessages(deleteBtn));
+    exportBtn.addEventListener('click', () => exportToObsidian(exportBtn, deleteBtn));
 
     // 插入顺序：[📥 Obsidian] [🗑️ 删除已载入] [...]
     container.insertBefore(deleteBtn, moreBtn);

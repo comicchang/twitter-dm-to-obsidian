@@ -70,12 +70,14 @@ actionsArea:  '[style*="grid-area: actions"]'    // hover后才有内容
 ## Obsidian URI
 
 ```
-obsidian://advanced-uri?daily=true&mode=append&data={encodeURIComponent(content)}
+obsidian://advanced-uri?daily=true&mode=append&data={encodeURIComponent(encodeURIComponent(content))}
 ```
 
 - `vault` 参数留空时省略 → Advanced URI 使用当前打开的 vault
-- 必须用 `encodeURIComponent` 构造，**不能用** `URLSearchParams`（空格会编为 `+`，Obsidian 不解码）
-- URI 长度上限 `URI_MAX = 8000`，超出时循环削减 100 字符直到满足
+- 必须手动拼接 URI，**不能用** `URLSearchParams`（空格会编为 `+`，Obsidian 不解码）
+- `data` / `vault` / `dailyNotePath` 统一做双层 `encodeURIComponent`，兼容宿主链路可能发生的一次预解码
+- URI 长度上限保守控制为 `URI_SOFT_MAX = 7000`、`URI_MAX = 7400`，避免 custom URI 被链路截断后触发 `URI malformed`
+- 导出超限时只发送“从前往后”装得下的消息前缀，并只把这部分消息标记为可删除
 
 ## t.co 展开
 

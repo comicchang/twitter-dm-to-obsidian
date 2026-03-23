@@ -95,7 +95,7 @@ Logseq / Obsidian outliner 格式，无额外 header/footer：
 
 - **虚拟列表**：一次只能导出当前已渲染的消息，无法一次性导出全部历史
 - **删除功能**：依赖 JS 模拟鼠标 hover 触发 React 事件，成功率不稳定；失败时请手动删除
-- **URI 长度上限**：单次导出最多约 8000 字符，超出会截断并提示
+- **URI 长度上限**：为规避浏览器/Obsidian 对 custom URI 的截断，单次导出保守控制在约 7000 字符；超出时只归档前面装得下的消息，剩余消息留待下一轮
 - **图片**：推文内嵌图片 URL 可能有时效限制；视频 URL（`video.twimg.com`）长期有效
 - **时间戳格式**：显示 Twitter 原始相对时间（`22h` / `Mar 1`），不转换为绝对时间
 
@@ -105,6 +105,7 @@ Logseq / Obsidian outliner 格式，无额外 header/footer：
 
 | 版本 | 变更 |
 |------|------|
+| 3.8.1 | Advanced URI 参数改为双层编码，规避 `%` 内容触发 `URI malformed`；导出改为只归档可装下的前缀消息，删除只作用于已归档消息 |
 | 3.8.0 | oEmbed 补全推文正文及链接；t.co 解析 HTML anchor 展开；删除流程适配 Radix UI Popover；虚拟列表从下往上逐条删除 |
 | 3.6.0 | 输出改为 Logseq outliner 格式 |
 | 3.5.0 | 提取推文作者、时间戳、视频/图片媒体 |
@@ -119,7 +120,14 @@ Logseq / Obsidian outliner 格式，无额外 header/footer：
 ### 1. URLSearchParams 把空格编为 `+`
 
 Obsidian Advanced URI 用 `decodeURIComponent` 解码 `data` 参数，而 `URLSearchParams` 把空格编为 `+`（application/x-www-form-urlencoded 标准），`decodeURIComponent('+')` 仍是 `+`，导致所有空格变成加号。
-**解决**：手动拼接 URI，只用 `encodeURIComponent`，不用 `URLSearchParams`。
+**解决**：手动拼接 URI，不用 `URLSearchParams`。同时对传给 Advanced URI 的值做双层 `encodeURIComponent`，兼容宿主链路可能发生的一次预解码。
+
+---
+
+### 1.1 `URI malformed` 多半是 `%` 或超长 URI 被链路截断
+
+部分浏览器/桌面端在把 `obsidian://advanced-uri?...` 交给 Obsidian 前，可能会先解码一层或截断过长 URI。这样一来，原文里只要有 `%`，或者 URI 末尾刚好断在 `%E4` 这种半个转义序列上，Advanced URI 插件里的 `decodeURIComponent` 就会直接抛 `URIError: URI malformed`。
+**解决**：参数统一双层编码，并把单次导出的 URI 长度阈值调保守。超限时只导出前面装得下的消息，剩余消息留到下一轮处理。
 
 ---
 
