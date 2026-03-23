@@ -497,6 +497,9 @@
       messages = await resolveExtraLinks(messages);
     }
 
+    // Twitter DM 列表 DOM 通常是旧→新，导出时改为新→旧，优先归档最新消息。
+    messages = [...messages].reverse();
+
     const { selected, remaining, blockedBySingleOversize } = takeExportableMessagePrefix(messages);
     if (!selected.length) {
       btn.textContent = '📥 Obsidian';
@@ -527,7 +530,7 @@
       btn.disabled = false;
       if (remaining.length > 0) {
         alert(
-          `本次已归档前 ${selected.length} 条消息。` +
+          `本次已归档最新 ${selected.length} 条消息。` +
           `\n其余 ${remaining.length} 条因长度限制保留在当前列表。` +
           `\n删除时只会删除这次已归档到 Obsidian 的消息。`
         );
