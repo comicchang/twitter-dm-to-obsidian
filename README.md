@@ -105,6 +105,7 @@ Logseq / Obsidian outliner 格式，无额外 header/footer：
 
 | 版本 | 变更 |
 |------|------|
+| 3.8.2 | 去掉错误的导出反转顺序；单条超长消息支持精简版归档；失效推文归档时跳过但加入待删除列表 |
 | 3.8.1 | Advanced URI 参数改为双层编码，规避 `%` 内容触发 `URI malformed`；导出改为只归档可装下的前缀消息，删除只作用于已归档消息 |
 | 3.8.0 | oEmbed 补全推文正文及链接；t.co 解析 HTML anchor 展开；删除流程适配 Radix UI Popover；虚拟列表从下往上逐条删除 |
 | 3.6.0 | 输出改为 Logseq outliner 格式 |

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter DM to Obsidian
 // @namespace    https://github.com/comicchang/twitter-dm-to-obsidian
-// @version      3.8.1
+// @version      3.8.2
 // @description  将 Twitter/X DM 消息（转发推文）批量导入 Obsidian，支持删除已载入消息
 // @author       comicchang
 // @homepageURL  https://github.com/comicchang/twitter-dm-to-obsidian
@@ -185,18 +185,25 @@
    * 用 oEmbed 数据更新每条推文的正文（批量并发 3）：
    * - t.co 链接从正文中移除，加入 extraLinks 由 resolveExtraLinks 统一展开
    * - @mention / #hashtag 保留为纯文字
-   * 返回新数组，不修改原对象
+   * 返回 { messages, skippedMessageKeys }：
+   * - messages：仍可参与归档的消息
+   * - skippedMessageKeys：推文已失效，归档时跳过，但允许加入待删除集合
    */
   async function enrichWithOembed(messages) {
     const BATCH = 3;
     const result = messages.map(m => ({ ...m, extraLinks: [...(m.extraLinks || [])] }));
     const tweetItems = result.filter(m => m.url);
+    const skippedMessageKeys = [];
 
     for (let i = 0; i < tweetItems.length; i += BATCH) {
       await Promise.all(tweetItems.slice(i, i + BATCH).map(async msg => {
         const data = await fetchOembedData(msg.url);
-        if (!data) return;               // 网络错误：保留原始数据
-        if (data.notFound) { msg._skip = true; return; } // 推文已失效：标记跳过
+        if (!data) return; // 网络错误：保留原始数据
+        if (data.notFound) {
+          msg._skip = true;
+          skippedMessageKeys.push(msg.messageKey);
+          return;
+        }
 
         const { p, tcoLinks } = data;
 
@@ -218,7 +225,10 @@
       }));
     }
 
-    return result.filter(m => !m._skip);
+    return {
+      messages: result.filter(m => !m._skip),
+      skippedMessageKeys,
+    };
   }
 
   // ─── 消息提取 ────────────────────────────────────────────────────────────────
@@ -368,7 +378,7 @@
   // 阈值保守一些，避免传输途中被截断后留下半个 %xx 导致 URI malformed。
   const URI_MAX = 7400;
   const URI_SOFT_MAX = 7000;
-  // 安全门禁：每个会话记录“已导出过的消息 key”
+  // 安全门禁：每个会话记录“允许删除的消息 key”（已归档或已确认失效）
   const exportedMessageKeysByConversation = new Map();
 
   // 当前会话 key：/messages/{id} 或 /i/chat/{id}
@@ -417,8 +427,8 @@
     deleteBtn.style.opacity = canDelete ? '1' : '0.65';
     deleteBtn.style.cursor = canDelete ? 'pointer' : 'not-allowed';
     deleteBtn.title = canDelete
-      ? '仅删除当前已载入且已导出过的消息（不可撤销）'
-      : '安全检查：请先导出当前会话，删除只会作用于已导出消息';
+      ? '仅删除当前已载入且已归档，或已确认失效的消息（不可撤销）'
+      : '安全检查：请先执行归档；删除只会作用于已归档或已确认失效的消息';
   }
 
   // Advanced URI 在不同宿主链路里可能被提前解码一次。
@@ -438,10 +448,90 @@
     return u;
   }
 
+  function getSingleMessageUriLength(message) {
+    return buildObsidianUri('\n' + formatMarkdown([message])).length;
+  }
+
+  function buildOverflowNote({ textTrimmed, removedMediaCount, removedLinkCount }) {
+    const parts = [];
+    if (textTrimmed) parts.push('正文已截断');
+    if (removedMediaCount > 0) parts.push(`省略${removedMediaCount}个媒体`);
+    if (removedLinkCount > 0) parts.push(`省略${removedLinkCount}条链接`);
+    if (!parts.length) return '';
+    return `[内容过长，${parts.join('，')}]`;
+  }
+
+  function buildTruncatedText(baseText, maxLength, note) {
+    const safeBase = (baseText || '').trim();
+    if (!safeBase) return note || '';
+    if (maxLength <= 0) return note || '';
+    if (safeBase.length <= maxLength) {
+      return note ? `${safeBase}\n${note}` : safeBase;
+    }
+    const truncated = `${safeBase.slice(0, maxLength).trimEnd()}…`;
+    return note ? `${truncated}\n${note}` : truncated;
+  }
+
+  // 单条消息超限时，尽量降级成一个可归档版本，避免卡住后续“先归档再删除”的循环。
+  function fitSingleMessageWithinLimit(message) {
+    const originalMedia = [...(message.media || [])];
+    const originalLinks = [...(message.extraLinks || [])];
+    const originalText = message.text || '';
+
+    let removedMediaCount = 0;
+    let removedLinkCount = 0;
+    let textTrimmed = false;
+    let textLimit = originalText.length;
+
+    function buildCandidate() {
+      const note = buildOverflowNote({ textTrimmed, removedMediaCount, removedLinkCount });
+      const media = originalMedia.slice(0, originalMedia.length - removedMediaCount);
+      const extraLinks = originalLinks.slice(0, originalLinks.length - removedLinkCount);
+      const text = buildTruncatedText(originalText, textLimit, note);
+      return { ...message, media, extraLinks, text };
+    }
+
+    let candidate = buildCandidate();
+    if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
+
+    while (removedLinkCount < originalLinks.length) {
+      removedLinkCount++;
+      candidate = buildCandidate();
+      if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
+    }
+
+    while (removedMediaCount < originalMedia.length) {
+      removedMediaCount++;
+      candidate = buildCandidate();
+      if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
+    }
+
+    if (originalText) {
+      textTrimmed = true;
+      while (textLimit > 280) {
+        textLimit = Math.max(280, textLimit - 200);
+        candidate = buildCandidate();
+        if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
+      }
+    }
+
+    const minimalNote = message.url
+      ? '[内容过长，已截断，详见原推文链接]'
+      : '[内容过长，已截断]';
+    candidate = {
+      ...message,
+      media: [],
+      extraLinks: [],
+      text: minimalNote,
+    };
+    return getSingleMessageUriLength(candidate) <= URI_SOFT_MAX ? candidate : null;
+  }
+
   // 只选择“从前往后”能安全装进单次导出的消息前缀。
   // 超限后立即停止，剩余消息留给下一轮导出，避免一次触发多次 URI 调用。
   function takeExportableMessagePrefix(messages) {
     const selected = [];
+    let truncatedCount = 0;
 
     for (const msg of messages) {
       const next = [...selected, msg];
@@ -453,7 +543,16 @@
 
       const singleUri = buildObsidianUri('\n' + formatMarkdown([msg]));
       if (!selected.length && singleUri.length > URI_SOFT_MAX) {
-        return { selected: [], remaining: messages, blockedBySingleOversize: true };
+        const fitted = fitSingleMessageWithinLimit(msg);
+        if (fitted) {
+          return {
+            selected: [fitted],
+            remaining: messages.slice(1),
+            blockedBySingleOversize: false,
+            truncatedCount: 1,
+          };
+        }
+        return { selected: [], remaining: messages, blockedBySingleOversize: true, truncatedCount: 0 };
       }
       break;
     }
@@ -462,6 +561,7 @@
       selected,
       remaining: messages.slice(selected.length),
       blockedBySingleOversize: false,
+      truncatedCount,
     };
   }
 
@@ -476,6 +576,7 @@
     btn.disabled = true;
 
     let messages = scrapeLoadedMessages();
+    const skippedDeletedTweetKeys = [];
     if (!messages.length) {
       btn.textContent = '📥 Obsidian';
       btn.disabled = false;
@@ -487,7 +588,12 @@
     const tweetCount = messages.filter(m => m.url).length;
     if (tweetCount > 0) {
       btn.textContent = `⏳ 抓取推文 (${tweetCount})...`;
-      messages = await enrichWithOembed(messages);
+      const enriched = await enrichWithOembed(messages);
+      messages = enriched.messages;
+      skippedDeletedTweetKeys.push(...enriched.skippedMessageKeys);
+      if (skippedDeletedTweetKeys.length > 0) {
+        markMessagesExported(skippedDeletedTweetKeys);
+      }
     }
 
     // 展开卡片 DOM 里剩余的 t.co 短链（链接预览卡等）
@@ -497,13 +603,18 @@
       messages = await resolveExtraLinks(messages);
     }
 
-    // Twitter DM 列表 DOM 通常是旧→新，导出时改为新→旧，优先归档最新消息。
-    messages = [...messages].reverse();
-
-    const { selected, remaining, blockedBySingleOversize } = takeExportableMessagePrefix(messages);
+    const { selected, remaining, blockedBySingleOversize, truncatedCount } = takeExportableMessagePrefix(messages);
     if (!selected.length) {
       btn.textContent = '📥 Obsidian';
       btn.disabled = false;
+      if (deleteBtn && document.contains(deleteBtn)) syncDeleteGuard(deleteBtn);
+      if (skippedDeletedTweetKeys.length > 0) {
+        alert(
+          `本次跳过 ${skippedDeletedTweetKeys.length} 条已失效推文。` +
+          `\n这些消息未归档，但已加入待删除列表。`
+        );
+        return;
+      }
       alert(
         blockedBySingleOversize
           ? `未能导出：当前最前面的消息单条已超过 URI 安全上限（${URI_SOFT_MAX}）。`
@@ -528,11 +639,17 @@
       if (deleteBtn && document.contains(deleteBtn)) syncDeleteGuard(deleteBtn);
       btn.textContent = `✅ 已导出 ${selected.length} 条`;
       btn.disabled = false;
-      if (remaining.length > 0) {
+      if (remaining.length > 0 || truncatedCount > 0 || skippedDeletedTweetKeys.length > 0) {
+        const notice = [];
+        if (truncatedCount > 0) notice.push(`其中 ${truncatedCount} 条因过长已按精简版归档。`);
+        if (remaining.length > 0) notice.push(`其余 ${remaining.length} 条因长度限制保留在当前列表。`);
+        if (skippedDeletedTweetKeys.length > 0) {
+          notice.push(`另有 ${skippedDeletedTweetKeys.length} 条已失效推文未归档，但已加入待删除列表。`);
+        }
         alert(
-          `本次已归档最新 ${selected.length} 条消息。` +
-          `\n其余 ${remaining.length} 条因长度限制保留在当前列表。` +
-          `\n删除时只会删除这次已归档到 Obsidian 的消息。`
+          `本次已归档 ${selected.length} 条消息。` +
+          `\n${notice.join('\n')}` +
+          `\n删除时会删除这次已归档，或已确认为失效的消息。`
         );
       }
       setTimeout(() => { btn.textContent = '📥 Obsidian'; }, 3500);
@@ -610,21 +727,21 @@
   async function deleteAllMessages(deleteBtn) {
     if (!hasExportedCurrentConversation()) {
       syncDeleteGuard(deleteBtn);
-      alert('安全检查未通过：请先导出当前会话。');
+      alert('安全检查未通过：请先执行归档。');
       return;
     }
 
     const initial = scrapeLoadedMessages().filter(m => isMessageExported(m.messageKey));
     if (!initial.length) {
       syncDeleteGuard(deleteBtn);
-      alert('未找到“已载入且已导出”的消息。');
+      alert('未找到“已载入且可删除”的消息。');
       return;
     }
 
     if (!window.confirm(
-      `确认删除已载入且已导出的 ${initial.length} 条消息？\n\n` +
+      `确认删除已载入且可删除的 ${initial.length} 条消息？\n\n` +
       `⚠️ 不可撤销，仅删除你这侧的记录。\n` +
-      `⚠️ 未导出的消息不会被删除。`
+      `⚠️ 未归档且未确认失效的消息不会被删除。`
     )) return;
 
     deleteBtn.disabled = true;
