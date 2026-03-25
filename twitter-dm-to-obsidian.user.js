@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter DM to Obsidian
 // @namespace    https://github.com/comicchang/twitter-dm-to-obsidian
-// @version      3.8.2
+// @version      3.8.3
 // @description  将 Twitter/X DM 消息（转发推文）批量导入 Obsidian，支持删除已载入消息
 // @author       comicchang
 // @homepageURL  https://github.com/comicchang/twitter-dm-to-obsidian
@@ -325,23 +325,10 @@
     return result;
   }
 
-  function getTweetStatusId(url) {
-    const match = url?.match(/\/status\/(\d+)/);
-    return match ? BigInt(match[1]) : null;
-  }
-
-  // 导出时优先按 tweet status id 排序；这是 snowflake，数值越大通常越新。
-  // 没有 status id 的纯文字消息，再按页面中的实际位置排序兜底。
+  // 导出顺序应跟随 DM 对话本身，而不是原推文发布时间。
+  // 这里按页面中的实际位置排序：越靠下通常越新，也更接近“转发给机器人”的先后顺序。
   function sortMessagesForExport(messages) {
     return [...messages].sort((a, b) => {
-      const aStatusId = getTweetStatusId(a.url);
-      const bStatusId = getTweetStatusId(b.url);
-      if (aStatusId !== null && bStatusId !== null && aStatusId !== bStatusId) {
-        return aStatusId > bStatusId ? -1 : 1;
-      }
-      if (aStatusId !== null && bStatusId === null) return -1;
-      if (aStatusId === null && bStatusId !== null) return 1;
-
       const aTop = a.liEl?.getBoundingClientRect?.().top ?? 0;
       const bTop = b.liEl?.getBoundingClientRect?.().top ?? 0;
       if (aTop !== bTop) return bTop - aTop;
@@ -402,8 +389,11 @@
   // 阈值保守一些，避免传输途中被截断后留下半个 %xx 导致 URI malformed。
   const URI_MAX = 7400;
   const URI_SOFT_MAX = 7000;
+  const BUTTON_STATUS_RESET_MS = 3500;
+  const DELETE_CONFIRM_ARM_MS = 4000;
   // 安全门禁：每个会话记录“允许删除的消息 key”（已归档或已确认失效）
   const exportedMessageKeysByConversation = new Map();
+  const EXPORT_STATE_STORAGE_PREFIX = 'twitter-dm-to-obsidian:exported:';
 
   // 当前会话 key：/messages/{id} 或 /i/chat/{id}
   function getCurrentConversationKey() {
@@ -411,13 +401,41 @@
     return m ? m[0] : '';
   }
 
+  function getExportStateStorageKey(conversationKey) {
+    return `${EXPORT_STATE_STORAGE_PREFIX}${conversationKey}`;
+  }
+
+  function loadPersistedMessageSet(conversationKey) {
+    try {
+      const raw = localStorage.getItem(getExportStateStorageKey(conversationKey));
+      if (!raw) return new Set();
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? new Set(parsed.filter(v => typeof v === 'string' && v)) : new Set();
+    } catch {
+      return new Set();
+    }
+  }
+
+  function savePersistedMessageSet(conversationKey, set) {
+    try {
+      const storageKey = getExportStateStorageKey(conversationKey);
+      if (!set.size) {
+        localStorage.removeItem(storageKey);
+        return;
+      }
+      localStorage.setItem(storageKey, JSON.stringify([...set]));
+    } catch {}
+  }
+
   function getExportedMessageSetForCurrentConversation(create = false) {
     const key = getCurrentConversationKey();
     if (!key) return null;
     let set = exportedMessageKeysByConversation.get(key);
-    if (!set && create) {
-      set = new Set();
-      exportedMessageKeysByConversation.set(key, set);
+    if (!set) {
+      set = loadPersistedMessageSet(key);
+      if (create || set.size > 0) {
+        exportedMessageKeysByConversation.set(key, set);
+      }
     }
     return set || null;
   }
@@ -433,15 +451,22 @@
   }
 
   function markMessagesExported(messageKeys) {
+    const conversationKey = getCurrentConversationKey();
     const set = getExportedMessageSetForCurrentConversation(true);
-    if (!set) return;
-    for (const key of messageKeys) set.add(key);
+    if (!set || !conversationKey) return;
+    for (const messageKey of messageKeys) set.add(messageKey);
+    exportedMessageKeysByConversation.set(conversationKey, set);
+    savePersistedMessageSet(conversationKey, set);
   }
 
   function unmarkMessageExported(messageKey) {
+    const conversationKey = getCurrentConversationKey();
     const set = getExportedMessageSetForCurrentConversation(false);
-    if (!set) return;
+    if (!set || !conversationKey) return;
     set.delete(messageKey);
+    if (set.size > 0) exportedMessageKeysByConversation.set(conversationKey, set);
+    else exportedMessageKeysByConversation.delete(conversationKey);
+    savePersistedMessageSet(conversationKey, set);
   }
 
   // 根据安全门禁刷新删除按钮状态
@@ -453,6 +478,48 @@
     deleteBtn.title = canDelete
       ? '仅删除当前已载入且已归档，或已确认失效的消息（不可撤销）'
       : '安全检查：请先执行归档；删除只会作用于已归档或已确认失效的消息';
+  }
+
+  function getExportButtonIdleLabel() {
+    return CONFIG.debug ? '📥 Obsidian [D]' : '📥 Obsidian';
+  }
+
+  function setButtonStatus(btn, label, { disabled = false, resetTo = '', resetMs = BUTTON_STATUS_RESET_MS, onReset } = {}) {
+    if (!btn) return;
+    clearTimeout(btn._statusTimer);
+    btn.textContent = label;
+    btn.disabled = disabled;
+    if (!resetTo) return;
+    btn._statusTimer = setTimeout(() => {
+      btn.textContent = resetTo;
+      btn.disabled = false;
+      if (onReset) onReset();
+    }, resetMs);
+  }
+
+  function clearDeleteConfirmState(deleteBtn, { syncGuard = true } = {}) {
+    if (!deleteBtn) return;
+    clearTimeout(deleteBtn._confirmTimer);
+    deleteBtn.dataset.confirmDelete = '';
+    deleteBtn.dataset.confirmDeleteCount = '';
+    if (syncGuard) {
+      deleteBtn.textContent = '🗑️ 删除已载入';
+      syncDeleteGuard(deleteBtn);
+    }
+  }
+
+  function armDeleteConfirm(deleteBtn, count) {
+    clearDeleteConfirmState(deleteBtn, { syncGuard: false });
+    deleteBtn.dataset.confirmDelete = '1';
+    deleteBtn.dataset.confirmDeleteCount = String(count);
+    deleteBtn.disabled = false;
+    deleteBtn.style.opacity = '1';
+    deleteBtn.style.cursor = 'pointer';
+    deleteBtn.textContent = `⚠️ 再点删除 ${count} 条`;
+    deleteBtn.title = '再次点击以确认删除；超时会自动取消';
+    deleteBtn._confirmTimer = setTimeout(() => {
+      clearDeleteConfirmState(deleteBtn);
+    }, DELETE_CONFIRM_ARM_MS);
   }
 
   // Advanced URI 在不同宿主链路里可能被提前解码一次。
@@ -592,19 +659,19 @@
   async function exportToObsidian(btn, deleteBtn) {
     const ul = document.querySelector(`${SEL.messageList} ul`);
     if (!ul) {
-      alert('未找到消息列表，请确认已打开一个 DM 对话');
+      setButtonStatus(btn, '⚠️ 未找到对话', { resetTo: getExportButtonIdleLabel() });
       return;
     }
 
     btn.textContent = '⏳ 抓取中...';
     btn.disabled = true;
 
-    let messages = sortMessagesForExport(scrapeLoadedMessages());
+    let messages = sortMessagesForExport(scrapeLoadedMessages())
+      .filter(m => !isMessageExported(m.messageKey));
     const skippedDeletedTweetKeys = [];
     if (!messages.length) {
-      btn.textContent = '📥 Obsidian';
-      btn.disabled = false;
-      alert('未找到可导出的消息内容');
+      if (deleteBtn && document.contains(deleteBtn)) syncDeleteGuard(deleteBtn);
+      setButtonStatus(btn, '⚪ 无新消息', { resetTo: getExportButtonIdleLabel() });
       return;
     }
 
@@ -629,29 +696,24 @@
 
     const { selected, remaining, blockedBySingleOversize, truncatedCount } = takeExportableMessagePrefix(messages);
     if (!selected.length) {
-      btn.textContent = '📥 Obsidian';
-      btn.disabled = false;
       if (deleteBtn && document.contains(deleteBtn)) syncDeleteGuard(deleteBtn);
       if (skippedDeletedTweetKeys.length > 0) {
-        alert(
-          `本次跳过 ${skippedDeletedTweetKeys.length} 条已失效推文。` +
-          `\n这些消息未归档，但已加入待删除列表。`
-        );
+        setButtonStatus(btn, `⏭️ 跳过失效 ${skippedDeletedTweetKeys.length}`, {
+          resetTo: getExportButtonIdleLabel(),
+        });
         return;
       }
-      alert(
-        blockedBySingleOversize
-          ? `未能导出：当前最前面的消息单条已超过 URI 安全上限（${URI_SOFT_MAX}）。`
-          : '未找到可导出的消息内容'
+      setButtonStatus(
+        btn,
+        blockedBySingleOversize ? `⚠️ 首条超长>${URI_SOFT_MAX}` : '⚠️ 无可导出消息',
+        { resetTo: getExportButtonIdleLabel() }
       );
       return;
     }
 
     const uri = buildObsidianUri('\n' + formatMarkdown(selected));
     if (uri.length > URI_MAX) {
-      btn.textContent = '📥 Obsidian';
-      btn.disabled = false;
-      alert(`未能导出：消息过长，单次导出已超过 URI 上限（${URI_MAX}）。`);
+      setButtonStatus(btn, `⚠️ 导出超限>${URI_MAX}`, { resetTo: getExportButtonIdleLabel() });
       return;
     }
 
@@ -661,22 +723,16 @@
 
     setTimeout(() => {
       if (deleteBtn && document.contains(deleteBtn)) syncDeleteGuard(deleteBtn);
-      btn.textContent = `✅ 已导出 ${selected.length} 条`;
-      btn.disabled = false;
-      if (remaining.length > 0 || truncatedCount > 0 || skippedDeletedTweetKeys.length > 0) {
-        const notice = [];
-        if (truncatedCount > 0) notice.push(`其中 ${truncatedCount} 条因过长已按精简版归档。`);
-        if (remaining.length > 0) notice.push(`其余 ${remaining.length} 条因长度限制保留在当前列表。`);
-        if (skippedDeletedTweetKeys.length > 0) {
-          notice.push(`另有 ${skippedDeletedTweetKeys.length} 条已失效推文未归档，但已加入待删除列表。`);
-        }
-        alert(
-          `本次已归档 ${selected.length} 条消息。` +
-          `\n${notice.join('\n')}` +
-          `\n删除时会删除这次已归档，或已确认为失效的消息。`
-        );
-      }
-      setTimeout(() => { btn.textContent = '📥 Obsidian'; }, 3500);
+      const summary = [`归档${selected.length}`];
+      if (truncatedCount > 0) summary.push(`精简${truncatedCount}`);
+      if (skippedDeletedTweetKeys.length > 0) summary.push(`失效${skippedDeletedTweetKeys.length}`);
+      if (remaining.length > 0) summary.push(`剩余${remaining.length}`);
+      setButtonStatus(btn, `✅ ${summary.join(' ')}`, {
+        resetTo: getExportButtonIdleLabel(),
+        onReset: () => {
+          if (deleteBtn && document.contains(deleteBtn)) syncDeleteGuard(deleteBtn);
+        },
+      });
     }, 1000);
   }
 
@@ -750,24 +806,30 @@
 
   async function deleteAllMessages(deleteBtn) {
     if (!hasExportedCurrentConversation()) {
-      syncDeleteGuard(deleteBtn);
-      alert('安全检查未通过：请先执行归档。');
+      clearDeleteConfirmState(deleteBtn);
+      setButtonStatus(deleteBtn, '⚠️ 先归档再删', {
+        resetTo: '🗑️ 删除已载入',
+        onReset: () => syncDeleteGuard(deleteBtn),
+      });
       return;
     }
 
     const initial = scrapeLoadedMessages().filter(m => isMessageExported(m.messageKey));
     if (!initial.length) {
-      syncDeleteGuard(deleteBtn);
-      alert('未找到“已载入且可删除”的消息。');
+      clearDeleteConfirmState(deleteBtn);
+      setButtonStatus(deleteBtn, '⚪ 无可删消息', {
+        resetTo: '🗑️ 删除已载入',
+        onReset: () => syncDeleteGuard(deleteBtn),
+      });
       return;
     }
 
-    if (!window.confirm(
-      `确认删除已载入且可删除的 ${initial.length} 条消息？\n\n` +
-      `⚠️ 不可撤销，仅删除你这侧的记录。\n` +
-      `⚠️ 未归档且未确认失效的消息不会被删除。`
-    )) return;
+    if (deleteBtn.dataset.confirmDelete !== '1') {
+      armDeleteConfirm(deleteBtn, initial.length);
+      return;
+    }
 
+    clearDeleteConfirmState(deleteBtn, { syncGuard: false });
     deleteBtn.disabled = true;
     let success = 0, fail = 0;
     const total = initial.length;
@@ -801,18 +863,15 @@
     }
 
     deleteBtn.disabled = false;
-    deleteBtn.textContent = fail === 0
-      ? `✅ 删除 ${success} 条`
-      : `⚠️ ${success} 成功 / ${fail} 失败`;
-
-    if (fail > 0) {
-      alert(`${success} 条成功，${fail} 条失败。\n请手动删除剩余消息。`);
-    }
-
-    setTimeout(() => {
-      deleteBtn.textContent = '🗑️ 删除已载入';
-      syncDeleteGuard(deleteBtn);
-    }, 4000);
+    setButtonStatus(
+      deleteBtn,
+      fail === 0 ? `✅ 删除 ${success} 条` : `⚠️ 删成${success} 失败${fail}`,
+      {
+        resetTo: '🗑️ 删除已载入',
+        resetMs: 4000,
+        onReset: () => syncDeleteGuard(deleteBtn),
+      }
+    );
   }
 
   // ─── 按钮注入 ────────────────────────────────────────────────────────────────
@@ -845,6 +904,9 @@
     const existingExportBtn = document.getElementById('obsidian-export-btn');
     const existingDeleteBtn = document.getElementById('obsidian-delete-btn');
     if (existingExportBtn && existingDeleteBtn) {
+      if (existingDeleteBtn.dataset.confirmDelete === '1' && !hasExportedCurrentConversation()) {
+        clearDeleteConfirmState(existingDeleteBtn);
+      }
       syncDeleteGuard(existingDeleteBtn);
       return;
     }
