@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter DM to Obsidian
 // @namespace    https://github.com/comicchang/twitter-dm-to-obsidian
-// @version      3.8.3
+// @version      3.8.4
 // @description  将 Twitter/X DM 消息（转发推文）批量导入 Obsidian，支持删除已载入消息
 // @author       comicchang
 // @homepageURL  https://github.com/comicchang/twitter-dm-to-obsidian
@@ -749,20 +749,29 @@
     dispatchHoverEvents(msgEl);
     await sleep(700);
 
-    const actionsDiv = msgEl.querySelector(SEL.actionsArea);
-    if (!actionsDiv) {
-      console.warn('[delete]', label, '→ actionsDiv 未出现（hover 未触发）');
-      return false;
-    }
+    // 优先用 message-overflow-button-{UUID}（新版 DOM 结构）
+    // 回退到旧版 grid-area: actions 内的最后一个按钮
+    const msgUuid = (msgEl.getAttribute('data-testid') || '').replace(/^message-/, '');
+    const overflowBtn = msgUuid
+      ? msgEl.querySelector(`[data-testid="message-overflow-button-${msgUuid}"]`)
+      : null;
 
-    const btns = actionsDiv.querySelectorAll('button');
-    if (!btns.length) {
-      console.warn('[delete]', label, '→ actionsDiv 内无按钮');
-      return false;
+    if (!overflowBtn) {
+      // 旧版回退
+      const actionsDiv = msgEl.querySelector(SEL.actionsArea);
+      if (!actionsDiv) {
+        console.warn('[delete]', label, '→ overflow 按钮未出现（hover 未触发）');
+        return false;
+      }
+      const btns = actionsDiv.querySelectorAll('button');
+      if (!btns.length) {
+        console.warn('[delete]', label, '→ actionsDiv 内无按钮');
+        return false;
+      }
+      btns[btns.length - 1].click();
+    } else {
+      overflowBtn.click();
     }
-
-    // 点击最后一个按钮（"..." 更多操作）
-    btns[btns.length - 1].click();
 
     // 轮询等待 Radix Popover 内的删除按钮出现（最多 1.5s）
     let deleteItem = null;

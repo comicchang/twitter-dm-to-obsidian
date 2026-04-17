@@ -38,7 +38,8 @@ CLAUDE.md
     ul
       li
         [data-testid^="message-{UUID}"]          ← 消息根元素（UUID = Twitter内部消息ID）
-          [style*="grid-area: actions"]           ← hover后操作按钮（初始为空）
+          [data-testid="message-reaction-button-{UUID}"]  ← hover后出现（表情）
+          [data-testid="message-overflow-button-{UUID}"]   ← hover后出现（"..."删除入口）
           [style*="grid-area: content"]           ← 消息内容
             a[href*="/status/"]                   ← 转发推文卡片
               [data-slot="hover-card-trigger"]
@@ -64,7 +65,9 @@ tweetCard:    'a[href*="/status/"]'
 tweetText:    'span[dir="auto"] > span'
 tweetAuthor:  '[data-slot="hover-card-trigger"] [class*="font-bold"]'
 tweetTime:    '[class*="text-gray-800"]'         // card内第一个匹配=时间戳
-actionsArea:  '[style*="grid-area: actions"]'    // hover后才有内容
+actionsArea:  '[style*="grid-area: actions"]'    // 旧版回退（新版已弃用）
+// 新版操作按钮 testid 格式（hover后出现，直接在 msgEl 内）：
+// message-reaction-button-{UUID}、message-overflow-button-{UUID}
 ```
 
 ## Obsidian URI
