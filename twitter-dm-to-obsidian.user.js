@@ -278,6 +278,8 @@
         if (a === card) continue;
         const href = a.href;
         if (!href || !href.startsWith('http')) continue;
+        // 过滤 Twitter/X 用户 profile 链接（x.com/user 或 twitter.com/user，无子路径）
+        if (/^https?:\/\/(x\.com|twitter\.com)\/[^/?#]+\/?$/.test(href)) continue;
         // 来源域名标签（"From github.com"）或链接文字
         const sourceLabel = a.querySelector('[class*="text-gray-5"], [class*="subtext2"]')
           ?.textContent?.trim();
