@@ -678,7 +678,8 @@
     btn.textContent = '⏳ 抓取中...';
     btn.disabled = true;
 
-    let messages = sortMessagesForExport(scraper())
+    // 书签页用 DOM 原始顺序（最新在前），DM 页按屏幕位置降序（底部最新在前）
+    let messages = (scraper === scrapeLoadedMessages ? sortMessagesForExport(scraper()) : scraper())
       .filter(m => !isMessageExported(m.messageKey));
     const skippedDeletedTweetKeys = [];
     if (!messages.length) {
@@ -1029,14 +1030,16 @@
     existingDeleteBtn?.remove();
 
     if (isBookmarks) {
-      const h2 = document.querySelector('[data-testid="primaryColumn"] h2');
-      if (!h2) {
+      // 找 header 区域的 caret 按钮（非 article 内），作为注入锚点
+      const headerCaret = [...document.querySelectorAll('[data-testid="primaryColumn"] [data-testid="caret"]')]
+        .find(el => !el.closest('article'));
+      if (!headerCaret) {
         if (!injectRetryTimer && injectRetryCount < 10) {
           injectRetryTimer = setTimeout(() => { injectRetryTimer = null; injectRetryCount++; tryInjectButtons(); }, 500);
         }
         return;
       }
-      const container = h2.parentElement?.parentElement;
+      const container = headerCaret.parentElement;
       if (!container) return;
       injectRetryCount = 0;
 
@@ -1049,7 +1052,9 @@
       exportBtn.title = CONFIG.debug ? '调试模式：写入 debug.md' : '将书签导出到 Obsidian Daily Note';
       exportBtn.addEventListener('click', () => exportToObsidian(exportBtn, deleteBtn, scrapeBookmarks));
 
-      container.append(exportBtn, deleteBtn);
+      // 插入顺序：[📥 Obsidian] [🗑️ 取消收藏] [更多]
+      container.insertBefore(deleteBtn, headerCaret);
+      container.insertBefore(exportBtn, deleteBtn);
       return;
     }
 
