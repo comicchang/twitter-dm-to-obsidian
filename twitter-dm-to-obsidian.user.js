@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter DM to Obsidian
 // @namespace    https://github.com/comicchang/twitter-dm-to-obsidian
-// @version      3.8.4
+// @version      3.9.0
 // @description  将 Twitter/X DM 消息（转发推文）批量导入 Obsidian，支持删除已载入消息
 // @author       comicchang
 // @homepageURL  https://github.com/comicchang/twitter-dm-to-obsidian
@@ -10,6 +10,8 @@
 // @match        https://twitter.com/messages/*
 // @match        https://x.com/messages/*
 // @match        https://x.com/i/chat/*
+// @match        https://x.com/i/bookmarks
+// @match        https://twitter.com/i/bookmarks
 // @grant        GM_xmlhttpRequest
 // @connect      *
 // @connect      publish.twitter.com
@@ -42,6 +44,9 @@
     tweetTime:    '[class*="text-gray-800"]',
     // hover 后出现的操作按钮区（初始为空的 div）
     actionsArea:  '[style*="grid-area: actions"]',
+    // 书签页
+    bookmarkArticle:   'article[data-testid="tweet"]',
+    bookmarkRemoveBtn: '[data-testid="removeBookmark"]',
   };
 
   // ─── 工具函数 ────────────────────────────────────────────────────────────────
@@ -400,7 +405,9 @@
   // 当前会话 key：/messages/{id} 或 /i/chat/{id}
   function getCurrentConversationKey() {
     const m = window.location.pathname.match(/^\/(?:messages|i\/chat)\/[^/]+/);
-    return m ? m[0] : '';
+    if (m) return m[0];
+    if (window.location.pathname.startsWith('/i/bookmarks')) return '/i/bookmarks';
+    return '';
   }
 
   function getExportStateStorageKey(conversationKey) {
@@ -658,17 +665,20 @@
     };
   }
 
-  async function exportToObsidian(btn, deleteBtn) {
-    const ul = document.querySelector(`${SEL.messageList} ul`);
-    if (!ul) {
-      setButtonStatus(btn, '⚠️ 未找到对话', { resetTo: getExportButtonIdleLabel() });
-      return;
+  async function exportToObsidian(btn, deleteBtn, scraper = null) {
+    if (!scraper) {
+      const ul = document.querySelector(`${SEL.messageList} ul`);
+      if (!ul) {
+        setButtonStatus(btn, '⚠️ 未找到对话', { resetTo: getExportButtonIdleLabel() });
+        return;
+      }
+      scraper = scrapeLoadedMessages;
     }
 
     btn.textContent = '⏳ 抓取中...';
     btn.disabled = true;
 
-    let messages = sortMessagesForExport(scrapeLoadedMessages())
+    let messages = sortMessagesForExport(scraper())
       .filter(m => !isMessageExported(m.messageKey));
     const skippedDeletedTweetKeys = [];
     if (!messages.length) {
@@ -910,23 +920,148 @@
     return btn;
   }
 
+
+  // ─── 书签页支持 ──────────────────────────────────────────────────────────────
+
+  function parseBookmarkArticle(article) {
+    const timeEl = article.querySelector('time');
+    const url = timeEl?.closest('a')?.href || '';
+    const userNameEl = article.querySelector('[data-testid="User-Name"]');
+    const author = userNameEl?.querySelector('span')?.textContent?.trim() || '';
+    const time = timeEl?.textContent?.trim() || '';
+    let text = '';
+    const textEl = article.querySelector('[data-testid="tweetText"]');
+    if (textEl) text = textEl.textContent.trim();
+    const media = [];
+    for (const v of article.querySelectorAll('video[src]')) {
+      media.push({ type: 'video', src: v.src });
+    }
+    for (const img of article.querySelectorAll('[data-testid="tweetPhoto"] img')) {
+      if (img.src) media.push({ type: 'image', src: img.src });
+    }
+    if (!url && !text) return null;
+    return { url, author, time, text, media, extraLinks: [] };
+  }
+
+  function scrapeBookmarks() {
+    const result = [];
+    for (const article of document.querySelectorAll(SEL.bookmarkArticle)) {
+      const data = parseBookmarkArticle(article);
+      if (!data) continue;
+      const messageKey = data.url ? `url:${data.url}` : `text:${data.text}`;
+      result.push({ liEl: article, articleEl: article, messageKey, ...data });
+    }
+    return result;
+  }
+
+  async function unbookmarkAll(deleteBtn) {
+    if (!hasExportedCurrentConversation()) {
+      clearDeleteConfirmState(deleteBtn);
+      setButtonStatus(deleteBtn, '⚠️ 先归档再取消', {
+        resetTo: '🗑️ 取消收藏',
+        onReset: () => syncDeleteGuard(deleteBtn),
+      });
+      return;
+    }
+
+    const initial = scrapeBookmarks().filter(m => isMessageExported(m.messageKey));
+    if (!initial.length) {
+      clearDeleteConfirmState(deleteBtn);
+      setButtonStatus(deleteBtn, '⚪ 无可取消书签', {
+        resetTo: '🗑️ 取消收藏',
+        onReset: () => syncDeleteGuard(deleteBtn),
+      });
+      return;
+    }
+
+    if (deleteBtn.dataset.confirmDelete !== '1') {
+      armDeleteConfirm(deleteBtn, initial.length);
+      return;
+    }
+
+    clearDeleteConfirmState(deleteBtn, { syncGuard: false });
+    deleteBtn.disabled = true;
+    let success = 0, fail = 0;
+    const total = initial.length;
+
+    for (const { articleEl, messageKey } of initial) {
+      if (!document.contains(articleEl)) continue;
+      deleteBtn.textContent = `⏳ ${success + fail + 1}/${total}`;
+      const removeBtn = articleEl.querySelector(SEL.bookmarkRemoveBtn);
+      if (removeBtn) {
+        removeBtn.click();
+        await sleep(300);
+        success++;
+        unmarkMessageExported(messageKey);
+      } else {
+        fail++;
+      }
+    }
+
+    deleteBtn.disabled = false;
+    setButtonStatus(
+      deleteBtn,
+      fail === 0 ? `✅ 取消 ${success} 条` : `⚠️ 成功${success} 失败${fail}`,
+      {
+        resetTo: '🗑️ 取消收藏',
+        resetMs: 4000,
+        onReset: () => syncDeleteGuard(deleteBtn),
+      }
+    );
+  }
+
   function tryInjectButtons() {
-    if (!/\/messages\/.+|\/i\/chat\/.+/.test(window.location.pathname)) return;
+    const path = window.location.pathname;
+    const isDM = /\/messages\/.+|\/i\/chat\/.+/.test(path);
+    const isBookmarks = path.startsWith('/i/bookmarks');
+    if (!isDM && !isBookmarks) return;
+
     const existingExportBtn = document.getElementById('obsidian-export-btn');
     const existingDeleteBtn = document.getElementById('obsidian-delete-btn');
     if (existingExportBtn && existingDeleteBtn) {
-      if (existingDeleteBtn.dataset.confirmDelete === '1' && !hasExportedCurrentConversation()) {
+      if (isDM && existingDeleteBtn.dataset.confirmDelete === '1' && !hasExportedCurrentConversation()) {
         clearDeleteConfirmState(existingDeleteBtn);
       }
       syncDeleteGuard(existingDeleteBtn);
       return;
     }
-    // 避免只残留单个按钮导致状态错乱
     existingExportBtn?.remove();
     existingDeleteBtn?.remove();
 
+    if (isBookmarks) {
+      const h2 = document.querySelector('[data-testid="primaryColumn"] h2');
+      if (!h2) {
+        if (!injectRetryTimer && injectRetryCount < 10) {
+          injectRetryTimer = setTimeout(() => { injectRetryTimer = null; injectRetryCount++; tryInjectButtons(); }, 500);
+        }
+        return;
+      }
+      const container = h2.parentElement?.parentElement;
+      if (!container) return;
+      injectRetryCount = 0;
+
+      const deleteBtn = makeBtn('obsidian-delete-btn', '🗑️ 取消收藏', '#dc2626', '#b91c1c');
+      syncDeleteGuard(deleteBtn);
+      deleteBtn.addEventListener('click', () => unbookmarkAll(deleteBtn));
+
+      const exportLabel = CONFIG.debug ? '📥 Obsidian [D]' : '📥 Obsidian';
+      const exportBtn = makeBtn('obsidian-export-btn', exportLabel, '#7c3aed', '#6d28d9');
+      exportBtn.title = CONFIG.debug ? '调试模式：写入 debug.md' : '将书签导出到 Obsidian Daily Note';
+      exportBtn.addEventListener('click', () => exportToObsidian(exportBtn, deleteBtn, scrapeBookmarks));
+
+      container.append(exportBtn, deleteBtn);
+      return;
+    }
+
+    // DM 模式
     const moreBtn = document.querySelector(SEL.moreBtn);
-    if (!moreBtn) return;
+    if (!moreBtn) {
+      if (!injectRetryTimer && injectRetryCount < 10) {
+        injectRetryTimer = setTimeout(() => { injectRetryTimer = null; injectRetryCount++; tryInjectButtons(); }, 500);
+      }
+      return;
+    }
+    injectRetryCount = 0;
 
     const container = moreBtn.parentElement;
     if (!container) return;
@@ -948,6 +1083,9 @@
   // ─── SPA 路由处理 ────────────────────────────────────────────────────────────
 
   let debounceTimer = null;
+  let injectRetryTimer = null;
+  let injectRetryCount = 0;
+
   const observer = new MutationObserver(() => {
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(tryInjectButtons, 100);
@@ -957,9 +1095,17 @@
   const origPushState = history.pushState.bind(history);
   history.pushState = function (...args) {
     origPushState(...args);
+    clearTimeout(injectRetryTimer);
+    injectRetryTimer = null;
+    injectRetryCount = 0;
     setTimeout(tryInjectButtons, 500);
   };
-  window.addEventListener('popstate', () => setTimeout(tryInjectButtons, 500));
+  window.addEventListener('popstate', () => {
+    clearTimeout(injectRetryTimer);
+    injectRetryTimer = null;
+    injectRetryCount = 0;
+    setTimeout(tryInjectButtons, 500);
+  });
 
   tryInjectButtons();
 })();
