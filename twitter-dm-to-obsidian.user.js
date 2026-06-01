@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter DM to Obsidian
 // @namespace    https://github.com/comicchang/twitter-dm-to-obsidian
-// @version      3.9.0
+// @version      3.9.3
 // @description  将 Twitter/X DM 消息（转发推文）批量导入 Obsidian，支持删除已载入消息
 // @author       comicchang
 // @homepageURL  https://github.com/comicchang/twitter-dm-to-obsidian
@@ -219,8 +219,12 @@
           ));
         }
 
-        // 更新正文（多余空格合并）
-        const cleaned = p.textContent.replace(/\s+/g, ' ').trim();
+        // 更新正文（保留换行，只合并行内多余空格）
+        const cleaned = p.textContent
+          .replace(/[^\S\n]+/g, ' ')   // 合并空格/制表符，保留换行
+          .replace(/^ +| +$/gm, '')      // 去除行首行尾空格
+          .replace(/\n{3,}/g, '\n\n')  // 最多保留两个连续换行
+          .trim();
         if (cleaned) msg.text = cleaned;
 
         // t.co 链接加入 extraLinks，交由 resolveExtraLinks 展开后统一去重
@@ -228,6 +232,17 @@
           msg.extraLinks.push({ href, label: '' });
         }
       }));
+    }
+
+    // 过滤冗余链接：如果 media 已有图片/视频，移除对应的 /photo/N 和 /video/N 链接
+    for (const msg of result) {
+      if (msg._skip) continue;
+      const hasMedia = (msg.media || []).length > 0;
+      if (!hasMedia) continue;
+      msg.extraLinks = (msg.extraLinks || []).filter(l =>
+        !/\/photo\/\d+(?:\?|$)/.test(l.href) &&
+        !/\/video\/\d+(?:\?|$)/.test(l.href)
+      );
     }
 
     return {
@@ -365,9 +380,16 @@
         const timeLink = `[${time || 'Tweet'}](${url})`;
         lines.push(`- ${author ? `${author} ` : ''}${timeLink}`);
 
-        // 正文：合并为单条子 bullet，多行文本保持连续缩进
+        // 正文：合并为单条子 bullet，多行文本按 nested list 处理
         if (text) {
-          lines.push(`\t- ${text.replace(/\n/g, '\n\t  ')}`);
+          const formatted = text.split('\n').map((line, idx) => {
+            if (idx === 0) return `\t- ${line}`;
+            const trimmed = line.trimEnd();
+            if (/^[-*] |^\d+\. /.test(trimmed)) return `\t\t- ${trimmed.replace(/^[-*] |^\d+\. /, '')}`;
+            if (trimmed === '') return `\t\t`;
+            return `\t  ${line}`;
+          }).join('\n');
+          lines.push(formatted);
         }
 
         // 媒体
@@ -1030,31 +1052,38 @@
     existingDeleteBtn?.remove();
 
     if (isBookmarks) {
-      // 找 header 区域的 caret 按钮（非 article 内），作为注入锚点
-      const headerCaret = [...document.querySelectorAll('[data-testid="primaryColumn"] [data-testid="caret"]')]
-        .find(el => !el.closest('article'));
-      if (!headerCaret) {
+      // 找 header 区域的 h2 "书签" 标题，作为注入锚点
+      const headerTitle = [...document.querySelectorAll('h2')]
+        .find(el => el.textContent.trim() === '书签');
+      if (!headerTitle) {
         if (!injectRetryTimer && injectRetryCount < 10) {
           injectRetryTimer = setTimeout(() => { injectRetryTimer = null; injectRetryCount++; tryInjectButtons(); }, 500);
         }
         return;
       }
-      const container = headerCaret.parentElement;
+      const container = headerTitle.parentElement;
       if (!container) return;
       injectRetryCount = 0;
 
-      const deleteBtn = makeBtn('obsidian-delete-btn', '🗑️ 取消收藏', '#dc2626', '#b91c1c');
-      syncDeleteGuard(deleteBtn);
-      deleteBtn.addEventListener('click', () => unbookmarkAll(deleteBtn));
+      // 改为水平布局，让按钮出现在标题右侧
+      container.style.flexDirection = 'row';
+      container.style.alignItems = 'center';
+      container.style.gap = '8px';
+      container.style.justifyContent = 'flex-start';
 
       const exportLabel = CONFIG.debug ? '📥 Obsidian [D]' : '📥 Obsidian';
-      const exportBtn = makeBtn('obsidian-export-btn', exportLabel, '#7c3aed', '#6d28d9');
+      const exportBtn = makeBtn('obsidian-export-btn', exportLabel, '#555b6e', '#6b7280');
       exportBtn.title = CONFIG.debug ? '调试模式：写入 debug.md' : '将书签导出到 Obsidian Daily Note';
-      exportBtn.addEventListener('click', () => exportToObsidian(exportBtn, deleteBtn, scrapeBookmarks));
 
-      // 插入顺序：[📥 Obsidian] [🗑️ 取消收藏] [更多]
-      container.insertBefore(deleteBtn, headerCaret);
-      container.insertBefore(exportBtn, deleteBtn);
+      const deleteBtn = makeBtn('obsidian-delete-btn', '🗑️ 取消收藏', '#4b362b', '#5c4a3e');
+      syncDeleteGuard(deleteBtn);
+
+      exportBtn.addEventListener('click', () => exportToObsidian(exportBtn, deleteBtn, scrapeBookmarks));
+      deleteBtn.addEventListener('click', () => unbookmarkAll(deleteBtn));
+
+      // appendChild 让按钮出现在 h2 右侧
+      container.appendChild(exportBtn);
+      container.appendChild(deleteBtn);
       return;
     }
 
@@ -1071,12 +1100,12 @@
     const container = moreBtn.parentElement;
     if (!container) return;
 
-    const deleteBtn = makeBtn('obsidian-delete-btn', '🗑️ 删除已载入', '#dc2626', '#b91c1c');
+    const deleteBtn = makeBtn('obsidian-delete-btn', '🗑️ 删除已载入', '#4b362b', '#5c4a3e');
     syncDeleteGuard(deleteBtn);
     deleteBtn.addEventListener('click', () => deleteAllMessages(deleteBtn));
 
     const exportLabel = CONFIG.debug ? '📥 Obsidian [D]' : '📥 Obsidian';
-    const exportBtn = makeBtn('obsidian-export-btn', exportLabel, '#7c3aed', '#6d28d9');
+    const exportBtn = makeBtn('obsidian-export-btn', exportLabel, '#555b6e', '#6b7280');
     exportBtn.title = CONFIG.debug ? '调试模式：写入 debug.md' : '将已载入消息保存到 Obsidian Daily Note';
     exportBtn.addEventListener('click', () => exportToObsidian(exportBtn, deleteBtn));
 
