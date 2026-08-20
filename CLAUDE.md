@@ -12,20 +12,22 @@ CLAUDE.md
 
 ## 架构概览
 
-脚本在 Twitter/X DM 页面（SPA）注入两个按钮，无服务端，所有逻辑在浏览器内运行。
+脚本在 Twitter/X 的 DM 会话页与书签/历史页（SPA）注入两个按钮，无服务端，所有逻辑在浏览器内运行。
 
 ```
 页面加载/路由切换
-  └─ tryInjectButtons()          按钮注入（MutationObserver + pushState 劫持）
-       └─ exportToObsidian()     📥 导出流程
-            ├─ expandShowMore()  展开截断正文（调 React onClick，无网络请求）
-            ├─ scrapeLoadedMessages()
-            │    └─ parseMessage()  提取 url/author/time/text/media/extraLinks
-            ├─ resolveExtraLinks()  t.co 短链展开（GM_xmlhttpRequest，5并发）
-            ├─ formatMarkdown()     Logseq outliner 格式化
-            └─ obsidian://advanced-uri  追加到 Daily Note
-       └─ deleteAllMessages()    🗑️ 删除流程
-            └─ deleteSingleMessage()  hover模拟 → 点"..." → Delete → 确认
+  └─ tryInjectButtons()          按钮注入（MutationObserver + pushState 劫持；DM 与书签/历史两套锚点）
+       ├─ exportToObsidian()     📥 导出流程（DM / 书签页共用，scraper 按页面注入）
+       │    ├─ scrapeLoadedMessages() / scrapeBookmarks()
+       │    │    └─ parseMessage() / parseBookmarkArticle()  提取 url/author/time/text/media/extraLinks
+       │    ├─ enrichWithOembed()   oEmbed 补全正文（fetchOembedData，批量并发 3，跳过失效推文）
+       │    ├─ resolveExtraLinks()  t.co 短链展开（GM_xmlhttpRequest，5 并发）
+       │    ├─ formatMarkdown()     Logseq outliner 格式化
+       │    └─ obsidian://advanced-uri  追加到 Daily Note
+       ├─ deleteAllMessages()     🗑️ DM 删除流程
+       │    └─ deleteSingleMessage()  overflow 按钮 → Popover 删除项 → dialog 确认
+       └─ unbookmarkAll()         🗑️ 书签/历史页取消收藏
+            └─ 点击 [data-testid="removeBookmark"]
 ```
 
 ## 实际 Twitter DOM 结构（2026-03 验证）
@@ -53,6 +55,17 @@ CLAUDE.md
 **重要**：`<a>` 嵌套 `<a>` 是非法 HTML，浏览器将链接预览卡解析为推文卡片的**兄弟节点**，
 因此 extraLinks 必须从 `[style*="grid-area: content"]` 容器查询，而非从 card 内部。
 
+书签/历史页 DOM（与 DM 结构不同，直接抓取 article，无 hover）：
+
+```
+article[data-testid="tweet"]            ← 每条书签的根元素
+  [data-testid="User-Name"]             ← 作者显示名
+  time → 最近的 a[href]                 ← 时间戳及其推文 URL
+  [data-testid="tweetText"]             ← 正文
+  [data-testid="tweetPhoto"] img        ← 推文图片
+  [data-testid="removeBookmark"]        ← "移除书签"按钮
+```
+
 ## 关键选择器（SEL 对象）
 
 若 Twitter 改版导致选择器失效，只需更新 `SEL` 常量：
@@ -66,6 +79,8 @@ tweetText:    'span[dir="auto"] > span'
 tweetAuthor:  '[data-slot="hover-card-trigger"] [class*="font-bold"]'
 tweetTime:    '[class*="text-gray-800"]'         // card内第一个匹配=时间戳
 actionsArea:  '[style*="grid-area: actions"]'    // 旧版回退（新版已弃用）
+bookmarkArticle:   'article[data-testid="tweet"]'       // 书签/历史页：每条书签的根元素
+bookmarkRemoveBtn: '[data-testid="removeBookmark"]'    // 书签条目内的"移除书签"按钮（点击即取消收藏）
 // 新版操作按钮 testid 格式（hover后出现，直接在 msgEl 内）：
 // message-reaction-button-{UUID}、message-overflow-button-{UUID}
 ```
@@ -85,28 +100,29 @@ obsidian://advanced-uri?daily=true&mode=append&data={encodeURIComponent(encodeUR
 ## t.co 展开
 
 x.com 的 CSP `connect-src` 不包含 `t.co`，`fetch` 会被阻断。
-必须用 `GM_xmlhttpRequest`（`@grant GM_xmlhttpRequest` + `@connect t.co`）在扩展沙箱内发起请求。
+必须用 `GM_xmlhttpRequest`（`@grant GM_xmlhttpRequest`，t.co 由 `@connect *` 通配白名单放行）在扩展沙箱内发起请求。
 
-## Show more 展开
+## oEmbed 补全
 
-Twitter 用 React 管理"Show more"状态，`.click()` 无效，必须调用 React 内部 onClick：
+DM 卡片只渲染推文预览，正文内的链接（t.co）可能不出现在卡片 DOM 里。
+通过 `publish.twitter.com/oembed`（GM_xmlhttpRequest，publish.twitter.com 由 `@connect *` 通配白名单放行）获取推文完整 HTML：
 
-```javascript
-const propsKey = Object.keys(span).find(k => k.startsWith('__reactProps'));
-span[propsKey].onClick({ preventDefault: noop, stopPropagation: noop, ... });
-```
-
-合成事件对象必须包含 `preventDefault`、`stopPropagation`、`stopImmediatePropagation`、
-`persist`、`isDefaultPrevented`、`isPropagationStopped`、`nativeEvent` 等方法，否则报错。
+1. `fetchOembedData(tweetUrl)` 请求 oEmbed，返回 blockquote `<p>` 及其中 t.co 链接列表；4xx 标记 `notFound`（推文已删除 / 不可见 / 账号停用）
+2. `enrichWithOembed(messages)` 批量并发 3：t.co `<a>` 从正文移除并加入 extraLinks（交由 resolveExtraLinks 统一展开），@mention / #hashtag 保留纯文字
+3. 失效推文（notFound）跳过归档，但标记为已导出，允许加入待删除集合
+4. 媒体冗余清理：已有图片/视频时移除对应的 `/photo/N`、`/video/N` 链接
 
 ## 删除机制
 
 依赖 JS 派发鼠标事件触发 React 渲染操作按钮，**不稳定**，可能失效：
 
 1. `scrollIntoView` → `dispatchHoverEvents`（pointerover/mouseover 冒泡版）
-2. 等待 `[style*="grid-area: actions"]` 内按钮出现
-3. 点击最后一个按钮（"..."）→ 找 `[role="menuitem"]` 中的 Delete/删除
-4. 处理二次确认弹窗
+2. 点击 `message-overflow-button-{UUID}`（hover 后出现；旧版回退 `[style*="grid-area: actions"]` 内最后一个按钮）
+3. Radix Popover 出现 → 轮询等待删除项（`action-menu-item-delete-for-me` / `action-menu-item-delete` / `action-menu-item-delete-for-everyone`）
+4. 点击删除项 → 轮询等待确认弹窗 `[role="dialog"] button[type="submit"]`（`[role="alertdialog"]` 同理；取消按钮是 `type="button"`）
+5. 无确认弹窗时视为删除成功
+
+书签/历史页的取消收藏不经过上述链路：直接点击每条 `article` 内的 `[data-testid="removeBookmark"]`。
 
 如需提高成功率，可考虑改用 Twitter 内部 API（需 bearer token 和 CSRF token）。
 
@@ -118,7 +134,10 @@ Twitter 是 SPA，三重保障：
 2. 劫持 `history.pushState`，延迟 500ms 重注入
 3. 监听 `popstate`
 
-注入守卫：URL 必须匹配 `/\/messages\/.+|\/i\/chat\/.+/`，且 `#obsidian-export-btn` 不存在。
+注入守卫（`tryInjectButtons` 内按页面模式判断）：
+- DM 页：URL 匹配 `/\/messages\/.+|\/i\/chat\/.+/`，且 `[data-testid="dm-conversation-more-button"]` 已渲染（否则 500ms 重试，最多 10 次）
+- 书签/历史页：URL 以 `/i/bookmarks` 或 `/i/history` 开头，且页面 `h2` 标题为「书签」/「历史」作为注入锚点（同样 500ms 重试，最多 10 次）
+- 两种模式共用守卫：`#obsidian-export-btn` 与 `#obsidian-delete-btn` 均已存在则跳过
 
 ## 输出格式
 

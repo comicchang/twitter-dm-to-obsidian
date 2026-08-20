@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Twitter DM to Obsidian
 // @namespace    https://github.com/comicchang/twitter-dm-to-obsidian
-// @version      3.9.3
-// @description  将 Twitter/X DM 消息（转发推文）批量导入 Obsidian，支持删除已载入消息
+// @version      3.9.4
+// @description  将 Twitter/X DM 消息（转发推文）批量导入 Obsidian，支持删除已载入消息、书签/历史页推文导入与取消收藏
 // @author       comicchang
 // @homepageURL  https://github.com/comicchang/twitter-dm-to-obsidian
 // @updateURL    https://raw.githubusercontent.com/comicchang/twitter-dm-to-obsidian/main/twitter-dm-to-obsidian.user.js
@@ -10,11 +10,13 @@
 // @match        https://twitter.com/messages/*
 // @match        https://x.com/messages/*
 // @match        https://x.com/i/chat/*
-// @match        https://x.com/i/bookmarks
-// @match        https://twitter.com/i/bookmarks
+// @match        https://twitter.com/i/chat/*
+// @match        https://x.com/i/bookmarks*
+// @match        https://twitter.com/i/bookmarks*
+// @match        https://x.com/i/history*
+// @match        https://twitter.com/i/history*
 // @grant        GM_xmlhttpRequest
 // @connect      *
-// @connect      publish.twitter.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -31,12 +33,15 @@
 
   // ─── DOM 选择器 ──────────────────────────────────────────────────────────────
   const SEL = {
+    // DM 消息列表容器（ul 的父级，用于定位已载入消息）
     messageList:  '[data-testid="dm-message-list"]',
+    // 单条消息项（data-testid 以 "message-" 开头）
     messageItem:  '[data-testid^="message-"]',
+    // 对话更多按钮（导出/删除按钮的注入锚点）
     moreBtn:      '[data-testid="dm-conversation-more-button"]',
     // 转发推文卡片的 <a> 链接（href 即原始推文 URL）
     tweetCard:    'a[href*="/status/"]',
-    // 推文正文：span[dir="auto"] 内的第一个 span 子节点
+    // 推文正文：第一个非空的 span 子节点
     tweetText:    'span[dir="auto"] > span',
     // 推文作者显示名（card header 内 hover-card-trigger 里的 font-bold）
     tweetAuthor:  '[data-slot="hover-card-trigger"] [class*="font-bold"]',
@@ -44,8 +49,9 @@
     tweetTime:    '[class*="text-gray-800"]',
     // hover 后出现的操作按钮区（初始为空的 div）
     actionsArea:  '[style*="grid-area: actions"]',
-    // 书签页
+    // 书签/历史页的推文卡片
     bookmarkArticle:   'article[data-testid="tweet"]',
+    // 书签页卡片上的取消收藏按钮
     bookmarkRemoveBtn: '[data-testid="removeBookmark"]',
   };
 
@@ -70,6 +76,9 @@
   // 展开结果缓存（同一页面会话内复用，避免重复请求）
   const urlCache = new Map();
 
+  // GM_xmlhttpRequest 超时（毫秒）：t.co/oEmbed 请求若长期无响应会拖住整个导出流程
+  const GM_REQUEST_TIMEOUT_MS = 10000;
+
   /**
    * 展开单个 t.co 短链，返回最终 URL
    * 使用 GM_xmlhttpRequest 绕过 x.com 的 CSP connect-src 限制
@@ -86,6 +95,8 @@
         GM_xmlhttpRequest({
           method: 'GET', url: u,
           headers: { 'User-Agent': navigator.userAgent },
+          timeout: GM_REQUEST_TIMEOUT_MS,
+          ontimeout: () => resolve(u), // 超时：保留原始 t.co 链接，避免流程卡死
           onload: r => {
             // 若 HTTP 层发生了真实重定向（部分环境下有效）
             const httpFinal = r.finalUrl || r.responseURL;
@@ -164,6 +175,8 @@
       GM_xmlhttpRequest({
         method: 'GET',
         url: `https://publish.twitter.com/oembed?url=${encodeURIComponent(tweetUrl)}&omit_script=true`,
+        timeout: GM_REQUEST_TIMEOUT_MS,
+        ontimeout: () => resolve(null), // 超时按网络错误处理：保留原始数据
         onload: r => {
           // 4xx：推文已删除 / 不可见 / 账号停用，标记为 notFound 供调用方过滤
           if (r.status >= 400 && r.status < 500) return resolve({ notFound: true });
@@ -424,11 +437,14 @@
   const exportedMessageKeysByConversation = new Map();
   const EXPORT_STATE_STORAGE_PREFIX = 'twitter-dm-to-obsidian:exported:';
 
-  // 当前会话 key：/messages/{id} 或 /i/chat/{id}
+  // 当前会话 key：/messages/{id}、/i/chat/{id}、/i/bookmarks、/i/history
+  // 书签与历史页必须使用不同 key：/i/history 是书签页新 URL，与 /i/bookmarks
+  // 为同一页面，共享状态会导致已导出记录污染删除安全门禁
   function getCurrentConversationKey() {
     const m = window.location.pathname.match(/^\/(?:messages|i\/chat)\/[^/]+/);
     if (m) return m[0];
     if (window.location.pathname.startsWith('/i/bookmarks')) return '/i/bookmarks';
+    if (window.location.pathname.startsWith('/i/history')) return '/i/history';
     return '';
   }
 
@@ -753,8 +769,10 @@
     }
 
     btn.textContent = `⏳ 导出 ${selected.length} 条...`;
-    window.location.href = uri;
+    // 先落库再导航：window.location.href 赋值后页面可能立即卸载/被系统提示打断，
+    // 必须保证已导出状态在导航发起前写入 localStorage，删除安全门禁才可靠
     markMessagesExported(selected.map(m => m.messageKey));
+    window.location.href = uri;
 
     setTimeout(() => {
       if (deleteBtn && document.contains(deleteBtn)) syncDeleteGuard(deleteBtn);
@@ -1036,7 +1054,7 @@
   function tryInjectButtons() {
     const path = window.location.pathname;
     const isDM = /\/messages\/.+|\/i\/chat\/.+/.test(path);
-    const isBookmarks = path.startsWith('/i/bookmarks');
+    const isBookmarks = path.startsWith('/i/bookmarks') || path.startsWith('/i/history');
     if (!isDM && !isBookmarks) return;
 
     const existingExportBtn = document.getElementById('obsidian-export-btn');
@@ -1052,9 +1070,9 @@
     existingDeleteBtn?.remove();
 
     if (isBookmarks) {
-      // 找 header 区域的 h2 "书签" 标题，作为注入锚点
+      // 找 header 区域的 h2 标题作为注入锚点（/i/history 页面标题是"历史"，/i/bookmarks 是"书签"）
       const headerTitle = [...document.querySelectorAll('h2')]
-        .find(el => el.textContent.trim() === '书签');
+        .find(el => el.textContent.trim() === '历史' || el.textContent.trim() === '书签');
       if (!headerTitle) {
         if (!injectRetryTimer && injectRetryCount < 10) {
           injectRetryTimer = setTimeout(() => { injectRetryTimer = null; injectRetryCount++; tryInjectButtons(); }, 500);
