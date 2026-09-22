@@ -103,8 +103,11 @@
         const translatedText = v.grok_translated_post?.translation || null;
         const lang = v.lang || '';
 
-        // 展开后的 URL（优先用译文实体的，其次用原文实体的）
-        const urlEntities = v.grok_translated_post?.entities?.urls || v.entities?.urls || [];
+        // 展开后的 URL（优先用译文实体的，其次用长推文实体的，最后用原文实体的）
+        const urlEntities = v.grok_translated_post?.entities?.urls
+          || v.note_tweet?.entity_set?.urls
+          || v.entities?.urls
+          || [];
         const expandedUrls = urlEntities.map(u => u.expanded_url).filter(Boolean);
 
         // 媒体
@@ -361,9 +364,11 @@
         // fiber 已提供完整正文（含译文），跳过 oEmbed 覆盖
         if (cleaned && !msg.isFromFiber) msg.text = cleaned;
 
-        // t.co 链接加入 extraLinks，交由 resolveExtraLinks 展开后统一去重
-        for (const href of tcoLinks) {
-          msg.extraLinks.push({ href, label: '' });
+        // t.co 链接加入 extraLinks（fiber 消息跳过：fiber 自带权威链接，oEmbed 是冗余+污染源）
+        if (!msg.isFromFiber) {
+          for (const href of tcoLinks) {
+            msg.extraLinks.push({ href, label: '' });
+          }
         }
       }));
     }
