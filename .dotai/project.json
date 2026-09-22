@@ -1,0 +1,77 @@
+{
+  "version": 2,
+  "packs": {
+    "web-dev": {
+      "files": {
+        ".claude/settings.json": {
+          "json": {
+            "mcpServers": {
+              "playwright": {
+                "command": "~/.claude/bin/playwright-mcp",
+                "args": []
+              },
+              "chrome-devtools": {
+                "command": "~/.claude/bin/chrome-devtools-mcp",
+                "args": [
+                  "--autoConnect"
+                ]
+              }
+            }
+          }
+        },
+        ".codex/config.toml": {
+          "toml": {
+            "mcp_servers.playwright": {
+              "type": "stdio",
+              "command": "~/.claude/bin/playwright-mcp",
+              "args": []
+            },
+            "mcp_servers.\"chrome-devtools\"": {
+              "type": "stdio",
+              "command": "~/.claude/bin/chrome-devtools-mcp",
+              "args": [
+                "--autoConnect"
+              ]
+            }
+          }
+        },
+        "opencode.json": {
+          "json": {
+            "mcp": {
+              "playwright": {
+                "type": "local",
+                "command": [
+                  "~/.claude/bin/playwright-mcp"
+                ],
+                "enabled": true
+              },
+              "chrome-devtools": {
+                "type": "local",
+                "command": [
+                  "~/.claude/bin/chrome-devtools-mcp"
+                ],
+                "args": [
+                  "--autoConnect"
+                ],
+                "enabled": true
+              }
+            }
+          }
+        }
+      },
+      "requested_mcp": [
+        "chrome-devtools",
+        "playwright"
+      ],
+      "effective_mcp": [
+        "chrome-devtools",
+        "playwright"
+      ]
+    }
+  },
+  "created_files": {
+    ".claude/settings.json": true,
+    ".codex/config.toml": true,
+    "opencode.json": true
+  }
+}

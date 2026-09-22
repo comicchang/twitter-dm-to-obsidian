@@ -119,7 +119,7 @@ Logseq / Obsidian outliner 格式，无额外 header/footer：
 
 | 版本 | 变更 |
 |------|------|
-| 3.9.5 | **DM 导出修复**：适配新 DOM（无 ul/li，嵌套 div）；`SEL.tweetAuthor` 移除失效的 `data-slot` 要求；`@match` 扩大到 `x.com/*` 解决 GreaseMonkey SPA 导航不注入按钮。**书签页 fiber 提取**：完整正文 + 译文 + 展开 URL；oEmbed 不覆盖已翻译文本。**链接清理**：过滤推文自身/analytics 链接；正文清理 t.co/pic.twitter.com。**格式**：作者名链接到 profile；Logseq outliner 格式对齐（空行无缩进、连续空行归一） |
+| 3.9.5 | **DM 导出修复**：适配新 DOM（无 ul/li，嵌套 div）；`SEL.tweetAuthor` 移除失效的 `data-slot` 要求；`@match` 扩大到 `x.com/*` 解决 GreaseMonkey SPA 导航不注入按钮。**书签页 fiber 提取**：完整正文 + 译文 + 展开 URL；oEmbed 不覆盖已翻译文本。**链接清理**：过滤推文自身/analytics 链接；正文清理 t.co/pic.twitter.com。**格式**：作者名链接到 profile；Logseq outliner 格式对齐（空行无缩进、连续空行归一）。**视觉反馈**：已导出推文降低透明度（0.55）+ 左侧蓝色边框，导出/删除后自动更新 |
 | 3.9.4 | 支持 `/i/history` 新 URL（X 已将 `/i/bookmarks` 重定向至 `/i/history`，历史/书签页均可注入按钮）；`GM_xmlhttpRequest` 请求增加 10 秒超时（t.co 展开与 oEmbed 超时不再拖死导出流程）；导出前先落库 `markMessagesExported` 再导航，保证删除安全门禁可靠；删除冗余 `@connect publish.twitter.com`；补充 `@match` 规则（`/i/chat/*`、`/i/bookmarks*`、`/i/history*`）；更新文档 |
 | 3.9.3 | formatMarkdown 修复：推文正文多行改为嵌套列表（以 `-`、`*`、`1.` 列表标记开头的行缩进为二级 bullet，空行与续行格式归一） |
 | 3.9.2 | 书签页按钮改为注入 h2 标题行容器（标题右侧水平布局）并调整配色；oEmbed 补全正文保留换行；过滤与已提取媒体重复的 `/photo/N`、`/video/N` 链接 |

@@ -918,6 +918,7 @@
           if (deleteBtn && document.contains(deleteBtn)) syncDeleteGuard(deleteBtn);
         },
       });
+      updateExportedVisuals();
     }, 1000);
   }
 
@@ -1066,6 +1067,7 @@
         onReset: () => syncDeleteGuard(deleteBtn),
       }
     );
+    updateExportedVisuals();
   }
 
   // ─── 按钮注入 ────────────────────────────────────────────────────────────────
@@ -1189,6 +1191,48 @@
         onReset: () => syncDeleteGuard(deleteBtn),
       }
     );
+    updateExportedVisuals();
+  }
+
+  // ─── 已导出推文的视觉标记 ──────────────────────────────────────────────────
+
+  // 注入 CSS 样式（仅一次）
+  function ensureExportedStyle() {
+    if (document.getElementById('obsidian-exported-style')) return;
+    const style = document.createElement('style');
+    style.id = 'obsidian-exported-style';
+    style.textContent = `
+      .obsidian-exported {
+        opacity: 0.55;
+        border-left: 3px solid #1d9bf0;
+        padding-left: 8px;
+        transition: opacity 0.3s ease, border-color 0.3s ease;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  // 遍历页面上所有推文，根据导出状态添加/移除视觉标记
+  function updateExportedVisuals() {
+    ensureExportedStyle();
+    // 书签/历史页
+    for (const article of document.querySelectorAll(SEL.bookmarkArticle)) {
+      const timeEl = article.querySelector('time');
+      const url = timeEl?.closest('a')?.href || '';
+      const key = url ? `url:${url}` : '';
+      article.classList.toggle('obsidian-exported', !!key && isMessageExported(key));
+    }
+    // DM 页
+    for (const msgEl of document.querySelectorAll('[data-testid^="message-"]')) {
+      const testid = msgEl.getAttribute('data-testid') || '';
+      if (testid.startsWith('message-text-')) continue;
+      if (testid.includes('-button-') || testid.includes('-reaction-')) continue;
+      const card = msgEl.querySelector('[style*="grid-area: content"] a[href*="/status/"]');
+      if (!card) continue;
+      const idPart = testid.startsWith('message-') ? testid.slice('message-'.length) : '';
+      const key = idPart ? `id:${idPart}` : `url:${card.href}`;
+      msgEl.classList.toggle('obsidian-exported', isMessageExported(key));
+    }
   }
 
   function tryInjectButtons() {
@@ -1204,6 +1248,7 @@
         clearDeleteConfirmState(existingDeleteBtn);
       }
       syncDeleteGuard(existingDeleteBtn);
+      updateExportedVisuals();
       return;
     }
     existingExportBtn?.remove();
@@ -1242,6 +1287,7 @@
       // appendChild 让按钮出现在 h2 右侧
       container.appendChild(exportBtn);
       container.appendChild(deleteBtn);
+      updateExportedVisuals();
       return;
     }
 
@@ -1270,6 +1316,7 @@
     // 插入顺序：[📥 Obsidian] [🗑️ 删除已载入] [...]
     container.insertBefore(deleteBtn, moreBtn);
     container.insertBefore(exportBtn, deleteBtn);
+    updateExportedVisuals();
   }
 
   // ─── SPA 路由处理 ────────────────────────────────────────────────────────────

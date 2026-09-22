@@ -1,0 +1,8 @@
+[mcp_servers.playwright]
+type = "stdio"
+command = "~/.claude/bin/playwright-mcp"
+args = []
+[mcp_servers."chrome-devtools"]
+type = "stdio"
+command = "~/.claude/bin/chrome-devtools-mcp"
+args = ["--autoConnect"]
