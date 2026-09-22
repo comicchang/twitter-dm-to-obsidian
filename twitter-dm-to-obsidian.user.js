@@ -918,7 +918,7 @@
           if (deleteBtn && document.contains(deleteBtn)) syncDeleteGuard(deleteBtn);
         },
       });
-      updateExportedVisuals();
+      updateExportedVisuals(true);
     }, 1000);
   }
 
@@ -1203,24 +1203,39 @@
     style.id = 'obsidian-exported-style';
     style.textContent = `
       .obsidian-exported {
-        opacity: 0.55;
+        opacity: 0.6;
         border-left: 3px solid #1d9bf0;
         padding-left: 8px;
-        transition: opacity 0.3s ease, border-color 0.3s ease;
+        background: rgba(29, 155, 240, 0.03);
+        transition: all 0.4s ease;
+      }
+      .obsidian-exported-flash {
+        animation: obsidian-flash 1.2s ease-out forwards;
+      }
+      @keyframes obsidian-flash {
+        0%   { background: rgba(29, 155, 240, 0.12); opacity: 1; }
+        100% { background: rgba(29, 155, 240, 0.03); opacity: 0.6; }
       }
     `;
     document.head.appendChild(style);
   }
 
   // 遍历页面上所有推文，根据导出状态添加/移除视觉标记
-  function updateExportedVisuals() {
+  // flash=true 时给新导出条目加高亮动画（导出完成后调用）
+  function updateExportedVisuals(flash = false) {
     ensureExportedStyle();
     // 书签/历史页
     for (const article of document.querySelectorAll(SEL.bookmarkArticle)) {
       const timeEl = article.querySelector('time');
       const url = timeEl?.closest('a')?.href || '';
       const key = url ? `url:${url}` : '';
-      article.classList.toggle('obsidian-exported', !!key && isMessageExported(key));
+      const exported = !!key && isMessageExported(key);
+      article.classList.toggle('obsidian-exported', exported);
+      if (flash && exported) {
+        article.classList.remove('obsidian-exported-flash');
+        void article.offsetWidth; // 触发 reflow 重启动画
+        article.classList.add('obsidian-exported-flash');
+      }
     }
     // DM 页
     for (const msgEl of document.querySelectorAll('[data-testid^="message-"]')) {
@@ -1231,7 +1246,13 @@
       if (!card) continue;
       const idPart = testid.startsWith('message-') ? testid.slice('message-'.length) : '';
       const key = idPart ? `id:${idPart}` : `url:${card.href}`;
-      msgEl.classList.toggle('obsidian-exported', isMessageExported(key));
+      const exported = isMessageExported(key);
+      msgEl.classList.toggle('obsidian-exported', exported);
+      if (flash && exported) {
+        msgEl.classList.remove('obsidian-exported-flash');
+        void msgEl.offsetWidth;
+        msgEl.classList.add('obsidian-exported-flash');
+      }
     }
   }
 
