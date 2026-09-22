@@ -96,6 +96,7 @@
         const tweetUrl = v.permalink
           ? `https://x.com${v.permalink}`
           : `https://x.com/${v.user.screen_name}/status/${v.id_str}`;
+        const tweetId = v.id_str || '';
         const authorUrl = `https://x.com/${v.user.screen_name}`;
 
         // 译文（Grok 翻译）
@@ -130,6 +131,8 @@
         for (const u of expandedUrls) {
           if (u === cardExpanded) continue; // 已通过 card 添加
           if (u === tweetUrl || u === authorUrl) continue;
+          // 过滤指向同一条推文的链接（/video/N、/photo/N 等）
+          if (tweetId && new RegExp(`/status/${tweetId}(/|$)`).test(u)) continue;
           extraLinks.push({ href: u, label: '' });
         }
 
@@ -139,7 +142,13 @@
           : '';
 
         // 清理正文中的 t.co/pic.twitter.com 引用（展开 URL 已在 extraLinks 中）
-        const displayText = (translatedText || v.full_text || '')
+        // 长推文（Twitter Blue）优先用 note_tweet.text，其次 extended_tweet.full_text
+        const rawText = translatedText
+          || v.note_tweet?.text
+          || v.extended_tweet?.full_text
+          || v.full_text
+          || '';
+        const displayText = rawText
           .replace(/\s*https?:\/\/t\.co\/\S+/g, '')
           .replace(/\s*pic\.twitter\.com\/\S+/g, '')
           .trim();
@@ -433,7 +442,7 @@
         // 过滤 Twitter/X 用户 profile 链接（x.com/user 或 twitter.com/user，无子路径）
         if (/^https?:\/\/(x\.com|twitter\.com)\/[^/?#]+\/?$/.test(href)) continue;
         // 过滤指向同一条推文的链接（时间元素、图片、video、analytics 等）
-        if (tweetId && href.includes(`/status/${tweetId}`)) continue;
+        if (tweetId && new RegExp(`/status/${tweetId}(/|$)`).test(href)) continue;
         // 来源域名标签（"From github.com"）或链接文字
         const sourceLabel = a.querySelector('[class*="text-gray-5"], [class*="subtext2"]')
           ?.textContent?.trim();
@@ -539,7 +548,7 @@
 
         // 媒体
         for (const { type, src } of media) {
-          if (type === 'video') lines.push(`\t- 🎬 [视频](${src})`);
+          if (type === 'video') lines.push(`\t- 🎬 ![](${src})`);
           else lines.push(`\t- ![](${src})`);
         }
 
@@ -1205,16 +1214,25 @@
       .obsidian-exported {
         opacity: 0.6;
         border-left: 3px solid #1d9bf0;
+        box-shadow: inset 0 0 0 1px rgba(29, 155, 240, 0.15);
         padding-left: 8px;
         background: rgba(29, 155, 240, 0.03);
         transition: all 0.4s ease;
       }
-      .obsidian-exported-flash {
-        animation: obsidian-flash 1.2s ease-out forwards;
+      .obsidian-export-flash {
+        animation: obsidian-flash 1.5s ease-out forwards !important;
       }
       @keyframes obsidian-flash {
-        0%   { background: rgba(29, 155, 240, 0.12); opacity: 1; }
-        100% { background: rgba(29, 155, 240, 0.03); opacity: 0.6; }
+        0%   { background: rgba(29, 155, 240, 0.2); box-shadow: inset 0 0 0 2px rgba(29, 155, 240, 0.4); opacity: 1; }
+        100% { background: rgba(29, 155, 240, 0.03); box-shadow: inset 0 0 0 1px rgba(29, 155, 240, 0.15); opacity: 0.6; }
+      }
+      .obsidian-delete-fade {
+        animation: obsidian-delete 0.4s ease-in forwards;
+        pointer-events: none;
+      }
+      @keyframes obsidian-delete {
+        0%   { opacity: 1; max-height: 500px; }
+        100% { opacity: 0; max-height: 0; overflow: hidden; padding: 0; margin: 0; }
       }
     `;
     document.head.appendChild(style);
@@ -1232,9 +1250,9 @@
       const exported = !!key && isMessageExported(key);
       article.classList.toggle('obsidian-exported', exported);
       if (flash && exported) {
-        article.classList.remove('obsidian-exported-flash');
-        void article.offsetWidth; // 触发 reflow 重启动画
-        article.classList.add('obsidian-exported-flash');
+        article.classList.remove('obsidian-export-flash');
+        void article.offsetWidth;
+        article.classList.add('obsidian-export-flash');
       }
     }
     // DM 页
@@ -1249,9 +1267,9 @@
       const exported = isMessageExported(key);
       msgEl.classList.toggle('obsidian-exported', exported);
       if (flash && exported) {
-        msgEl.classList.remove('obsidian-exported-flash');
+        msgEl.classList.remove('obsidian-export-flash');
         void msgEl.offsetWidth;
-        msgEl.classList.add('obsidian-exported-flash');
+        msgEl.classList.add('obsidian-export-flash');
       }
     }
   }
