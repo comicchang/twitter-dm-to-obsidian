@@ -1,20 +1,18 @@
 // ==UserScript==
 // @name         Twitter DM to Obsidian
 // @namespace    https://github.com/comicchang/twitter-dm-to-obsidian
-// @version      3.9.4
+// @version      3.9.5
 // @description  将 Twitter/X DM 消息（转发推文）批量导入 Obsidian，支持删除已载入消息、书签/历史页推文导入与取消收藏
 // @author       comicchang
 // @homepageURL  https://github.com/comicchang/twitter-dm-to-obsidian
 // @updateURL    https://raw.githubusercontent.com/comicchang/twitter-dm-to-obsidian/main/twitter-dm-to-obsidian.user.js
 // @downloadURL  https://raw.githubusercontent.com/comicchang/twitter-dm-to-obsidian/main/twitter-dm-to-obsidian.user.js
-// @match        https://twitter.com/messages/*
+// @match        https://x.com/*
+// @match        https://twitter.com/*
 // @match        https://x.com/messages/*
 // @match        https://x.com/i/chat/*
-// @match        https://twitter.com/i/chat/*
 // @match        https://x.com/i/bookmarks*
-// @match        https://twitter.com/i/bookmarks*
 // @match        https://x.com/i/history*
-// @match        https://twitter.com/i/history*
 // @grant        GM_xmlhttpRequest
 // @connect      *
 // @run-at       document-idle
@@ -43,8 +41,8 @@
     tweetCard:    'a[href*="/status/"]',
     // 推文正文：第一个非空的 span 子节点
     tweetText:    'span[dir="auto"] > span',
-    // 推文作者显示名（card header 内 hover-card-trigger 里的 font-bold）
-    tweetAuthor:  '[data-slot="hover-card-trigger"] [class*="font-bold"]',
+    // 推文作者显示名（card header 内带 font-bold 的元素）
+    tweetAuthor:  '[class*="font-bold"]',
     // 推文相对时间戳（card header 内 text-gray-800 元素）
     tweetTime:    '[class*="text-gray-800"]',
     // hover 后出现的操作按钮区（初始为空的 div）
@@ -69,6 +67,117 @@
     ['pointerenter', 'mouseenter'].forEach(t =>
       el.dispatchEvent(new MouseEvent(t, { ...opts, bubbles: false }))
     );
+  }
+
+  // ─── React Fiber 数据提取 ──────────────────────────────────────────────────
+  //
+  // 从推文 DOM 元素的 React fiber 树中提取完整推文数据。
+  // 优势：不截断、有译文、URL 已展开、无需 oEmbed 补全。
+
+  /**
+   * 从推文 DOM 元素的 React fiber 中提取完整数据
+   * @param {Element} el - article[data-testid="tweet"] 或含推文数据的 DOM 元素
+   * @returns {Object|null} 兼容 parseMessage 返回格式的对象，附带 translatedText/lang/isFromFiber
+   */
+  function extractTweetFromFiber(el) {
+    const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+    if (!fiberKey) return null;
+
+    let walk = el[fiberKey];
+    for (let depth = 0; depth < 25 && walk; depth++) {
+      const mp = walk.memoizedProps;
+      if (!mp) { walk = walk.return; continue; }
+
+      for (const key of Object.keys(mp)) {
+        const v = mp[key];
+        if (!v || typeof v !== 'object' || !v.full_text) continue;
+        if (!v.user?.screen_name) continue;
+
+        const tweetUrl = v.permalink
+          ? `https://x.com${v.permalink}`
+          : `https://x.com/${v.user.screen_name}/status/${v.id_str}`;
+        const authorUrl = `https://x.com/${v.user.screen_name}`;
+
+        // 译文（Grok 翻译）
+        const translatedText = v.grok_translated_post?.translation || null;
+        const lang = v.lang || '';
+
+        // 展开后的 URL（优先用译文实体的，其次用原文实体的）
+        const urlEntities = v.grok_translated_post?.entities?.urls || v.entities?.urls || [];
+        const expandedUrls = urlEntities.map(u => u.expanded_url).filter(Boolean);
+
+        // 媒体
+        const media = [];
+        for (const m of (v.extended_entities?.media || v.entities?.media || [])) {
+          if (m.type === 'video' || m.type === 'animated_gif') {
+            const best = (m.video_info?.variants || [])
+              .filter(vr => vr.content_type === 'video/mp4')
+              .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+            if (best) media.push({ type: 'video', src: best.url });
+          } else if (m.type === 'photo') {
+            media.push({ type: 'image', src: m.media_url_https || m.media_url });
+          }
+        }
+
+        // 额外链接：entities 中的展开 URL，排除推文自身和作者链接
+        const extraLinks = [];
+        const cardUrl = v.card?.url || '';
+        const cardExpanded = urlEntities.find(u => u.url === cardUrl)?.expanded_url;
+        if (cardExpanded) {
+          const label = v.card?.binding_values?.title?.string_value || '';
+          extraLinks.push({ href: cardExpanded, label });
+        }
+        for (const u of expandedUrls) {
+          if (u === cardExpanded) continue; // 已通过 card 添加
+          if (u === tweetUrl || u === authorUrl) continue;
+          extraLinks.push({ href: u, label: '' });
+        }
+
+        // 时间（显示原始相对时间，与 Twitter UI 一致）
+        const time = v.created_at
+          ? formatRelativeTime(v.created_at)
+          : '';
+
+        // 清理正文中的 t.co/pic.twitter.com 引用（展开 URL 已在 extraLinks 中）
+        const displayText = (translatedText || v.full_text || '')
+          .replace(/\s*https?:\/\/t\.co\/\S+/g, '')
+          .replace(/\s*pic\.twitter\.com\/\S+/g, '')
+          .trim();
+
+        return {
+          url: tweetUrl,
+          authorUrl,
+          author: v.user.name || '',
+          time,
+          text: displayText,
+          media,
+          extraLinks,
+          translatedText,
+          lang,
+          isFromFiber: true,
+        };
+      }
+      walk = walk.return;
+    }
+    return null;
+  }
+
+  /**
+   * 格式化为 Twitter 风格的相对时间（如 "22h"、"Mar 1"）
+   */
+  function formatRelativeTime(isoString) {
+    const now = Date.now();
+    const then = new Date(isoString).getTime();
+    const diffMs = now - then;
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 1) return 'now';
+    if (diffMin < 60) return `${diffMin}m`;
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return `${diffHr}h`;
+    const diffDay = Math.floor(diffHr / 24);
+    if (diffDay < 7) return `${diffDay}d`;
+    const d = new Date(isoString);
+    return `${d.toLocaleString('en', { month: 'short' })} ${d.getDate()}`;
   }
 
   // ─── t.co 短链展开 ──────────────────────────────────────────────────────────
@@ -232,13 +341,16 @@
           ));
         }
 
-        // 更新正文（保留换行，只合并行内多余空格）
+        // 更新正文（保留换行，只合并行内多余空格，清理残余 t.co/pic.twitter.com 引用）
         const cleaned = p.textContent
           .replace(/[^\S\n]+/g, ' ')   // 合并空格/制表符，保留换行
           .replace(/^ +| +$/gm, '')      // 去除行首行尾空格
           .replace(/\n{3,}/g, '\n\n')  // 最多保留两个连续换行
+          .replace(/\s*https?:\/\/t\.co\/\S+/g, '')   // 去除残余 t.co 短链文本
+          .replace(/\s*pic\.twitter\.com\/\S+/g, '')   // 去除 pic.twitter.com 引用
           .trim();
-        if (cleaned) msg.text = cleaned;
+        // fiber 已提供完整正文（含译文），跳过 oEmbed 覆盖
+        if (cleaned && !msg.isFromFiber) msg.text = cleaned;
 
         // t.co 链接加入 extraLinks，交由 resolveExtraLinks 展开后统一去重
         for (const href of tcoLinks) {
@@ -305,7 +417,14 @@
         if (img.src) media.push({ type: 'image', src: img.src });
       }
 
+      // 作者 profile URL（第一个匹配 x.com/user 或 twitter.com/user 的链接）
+      const authorUrl = allLinks.find(a =>
+        /^https?:\/\/(x\.com|twitter\.com)\/[^/?#]+\/?$/.test(a.href)
+      )?.href || '';
+
       // 额外链接：内容区内所有非推文状态页的链接（链接预览卡、t.co 等）
+      // 过滤：推文自身 URL、作者 profile、analytics 链接
+      const tweetId = (card.href.match(/\/status\/(\d+)/) || [])[1] || '';
       const extraLinks = [];
       for (const a of allLinks) {
         if (a === card) continue;
@@ -313,13 +432,15 @@
         if (!href || !href.startsWith('http')) continue;
         // 过滤 Twitter/X 用户 profile 链接（x.com/user 或 twitter.com/user，无子路径）
         if (/^https?:\/\/(x\.com|twitter\.com)\/[^/?#]+\/?$/.test(href)) continue;
+        // 过滤指向同一条推文的链接（时间元素、图片、video、analytics 等）
+        if (tweetId && href.includes(`/status/${tweetId}`)) continue;
         // 来源域名标签（"From github.com"）或链接文字
         const sourceLabel = a.querySelector('[class*="text-gray-5"], [class*="subtext2"]')
           ?.textContent?.trim();
         extraLinks.push({ href, label: sourceLabel || '' });
       }
 
-      return { url: card.href, author, time, text, media, extraLinks };
+      return { url: card.href, authorUrl, author, time, text, media, extraLinks };
     }
 
     // fallback：纯文字消息（无推文卡片）
@@ -338,24 +459,27 @@
    * 返回 [{liEl, msgEl, url, text}]
    */
   function scrapeLoadedMessages() {
-    const ul = document.querySelector(`${SEL.messageList} ul`);
-    if (!ul) return [];
+    // 适配新旧 DOM：旧版 ul>li 结构，新版嵌套 div 结构
+    const msgList = document.querySelector(SEL.messageList);
+    if (!msgList) return [];
 
     const result = [];
-    for (const li of ul.querySelectorAll('li')) {
-      const msgEl = li.querySelector(SEL.messageItem);
-      if (!msgEl) continue;
+    for (const msgEl of msgList.querySelectorAll('[data-testid^="message-"]')) {
+      const testid = msgEl.getAttribute('data-testid') || '';
+      // 跳过纯文本消息、按钮、表情反应等非主消息元素
+      if (testid.startsWith('message-text-')) continue;
+      if (testid.includes('-button-') || testid.includes('-reaction-')) continue;
+
       const data = parseMessage(msgEl);
       if (!data) continue;
 
       // 消息唯一键：优先使用 Twitter 内部 message-* id，其次回退到 URL/文本
-      const testId = msgEl.getAttribute('data-testid') || '';
-      const idPart = testId.startsWith('message-') ? testId.slice('message-'.length) : '';
+      const idPart = testid.startsWith('message-') ? testid.slice('message-'.length) : '';
       const messageKey = idPart
         ? `id:${idPart}`
         : (data.url ? `url:${data.url}` : `text:${data.text}`);
 
-      result.push({ liEl: li, msgEl, messageKey, ...data });
+      result.push({ liEl: msgEl, msgEl, messageKey, ...data });
     }
     return result;
   }
@@ -387,21 +511,29 @@
   function formatMarkdown(messages) {
     const lines = [];
 
-    for (const { url, author = '', time = '', text, media = [], extraLinks = [] } of messages) {
+    for (const { url, author = '', authorUrl = '', time = '', text, media = [], extraLinks = [] } of messages) {
       if (url) {
-        // 第一行：作者 + 时间戳链接
+        // 第一行：作者名链接到 profile，时间戳链接到推文
         const timeLink = `[${time || 'Tweet'}](${url})`;
-        lines.push(`- ${author ? `${author} ` : ''}${timeLink}`);
+        const authorDisplay = author && authorUrl ? `[${author}](${authorUrl})` : author;
+        lines.push(`- ${author ? `${authorDisplay} ` : ''}${timeLink}`);
 
         // 正文：合并为单条子 bullet，多行文本按 nested list 处理
+        // 空行保持为空（Logseq 规范：空行无缩进），连续空行归一
         if (text) {
+          let prevBlank = false;
           const formatted = text.split('\n').map((line, idx) => {
-            if (idx === 0) return `\t- ${line}`;
+            if (idx === 0) { prevBlank = false; return `\t- ${line}`; }
             const trimmed = line.trimEnd();
-            if (/^[-*] |^\d+\. /.test(trimmed)) return `\t\t- ${trimmed.replace(/^[-*] |^\d+\. /, '')}`;
-            if (trimmed === '') return `\t\t`;
+            if (/^[-*] |^\d+\. /.test(trimmed)) { prevBlank = false; return `\t\t- ${trimmed.replace(/^[-*] |^\d+\. /, '')}`; }
+            if (trimmed === '') {
+              if (prevBlank) return null; // 连续空行归一
+              prevBlank = true;
+              return '';
+            }
+            prevBlank = false;
             return `\t  ${line}`;
-          }).join('\n');
+          }).filter(l => l !== null).join('\n');
           lines.push(formatted);
         }
 
@@ -965,6 +1097,11 @@
   // ─── 书签页支持 ──────────────────────────────────────────────────────────────
 
   function parseBookmarkArticle(article) {
+    // 优先从 React fiber 提取完整数据（不截断、有译文、URL 已展开）
+    const fiberData = extractTweetFromFiber(article);
+    if (fiberData) return fiberData;
+
+    // 回退：DOM 抓取（可能截断、无译文）
     const timeEl = article.querySelector('time');
     const url = timeEl?.closest('a')?.href || '';
     const userNameEl = article.querySelector('[data-testid="User-Name"]');
@@ -980,8 +1117,11 @@
     for (const img of article.querySelectorAll('[data-testid="tweetPhoto"] img')) {
       if (img.src) media.push({ type: 'image', src: img.src });
     }
+    const authorUrl = [...article.querySelectorAll('a[href]')].find(a =>
+      /^https?:\/\/(x\.com|twitter\.com)\/[^/?#]+\/?$/.test(a.href)
+    )?.href || '';
     if (!url && !text) return null;
-    return { url, author, time, text, media, extraLinks: [] };
+    return { url, authorUrl, author, time, text, media, extraLinks: [] };
   }
 
   function scrapeBookmarks() {

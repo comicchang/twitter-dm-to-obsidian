@@ -36,16 +36,16 @@ CLAUDE.md
 [data-testid="dm-conversation-panel"]
   [data-testid="dm-conversation-header"]
     .parentElement of [data-testid="dm-conversation-more-button"]  ← 按钮注入位置
-  [data-testid="dm-message-list"]
-    ul
-      li
-        [data-testid^="message-{UUID}"]          ← 消息根元素（UUID = Twitter内部消息ID）
+  [data-testid="dm-message-list"]               ← DIV 容器（非 ul）
+    [data-testid="dm-message-scroller"]         ← 滚动容器
+      DIV                                       ← 消息包装层
+        [data-testid^="message-{UUID}"]         ← 消息根元素（UUID = Twitter内部消息ID）
+          [data-testid="message-text-{UUID}"]   ← 伴随纯文本消息（scraper 跳过）
           [data-testid="message-reaction-button-{UUID}"]  ← hover后出现（表情）
           [data-testid="message-overflow-button-{UUID}"]   ← hover后出现（"..."删除入口）
           [style*="grid-area: content"]           ← 消息内容
             a[href*="/status/"]                   ← 转发推文卡片
-              [data-slot="hover-card-trigger"]
-                [class*="font-bold"]             ← 作者显示名
+              [class*="font-bold"]               ← 作者显示名（2026-09 验证：无 data-slot）
               [class*="text-gray-800"]            ← 相对时间戳（"22h" / "Mar 1"）
               span[dir="auto"] > span             ← 推文正文
               video[src]                          ← 视频（URL长期有效）
