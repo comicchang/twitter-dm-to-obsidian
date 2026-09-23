@@ -78,9 +78,9 @@ def format_body(text):
 **Media/link line detection**:
 
 ```python
-# After line.strip(), media lines look like "- ![](url)" or "- 🔗 url"
+# After line.strip(), media lines look like "- ![](url)", "- 🔗 url", or "- <video ...>"
 stripped = line.strip()
-if stripped.startswith('- ![](') or stripped.startswith('- 🔗') or stripped.startswith('- 🎬'):
+if stripped.startswith('- ![](') or stripped.startswith('- 🔗') or stripped.startswith('- <video '):
     # Media or link line — preserve exactly as-is
 ```
 

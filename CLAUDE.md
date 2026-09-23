@@ -146,7 +146,7 @@ Logseq outliner 格式（无 header/footer）：
 ```markdown
 - 作者名 [22h](https://x.com/i/status/...)
   - 正文段落
-  - 🎬 [视频](https://video.twimg.com/...)
+  - <video src="https://video.twimg.com/..." controls style="max-width:480px"></video>
   - ![](https://pbs.twimg.com/...)
   - 🔗 [链接标题](https://github.com/...)
 

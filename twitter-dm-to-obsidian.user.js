@@ -517,7 +517,7 @@
   //
   // - 作者名 [Mar 1](https://x.com/i/status/...)
   // \t- 推文正文（多行文本合并为单条 bullet）
-  // \t- 🎬 [视频](https://video.twimg.com/...)
+  // \t- <video src="https://video.twimg.com/..." controls></video>
   // \t- 🔗 [链接标题](https://...)
   //
   // - 纯文字消息内容
@@ -553,7 +553,7 @@
 
         // 媒体
         for (const { type, src } of media) {
-          if (type === 'video') lines.push(`\t- 🎬 ![](${src})`);
+          if (type === 'video') lines.push(`\t- <video src="${src}" controls style="max-width:480px"></video>`);
           else lines.push(`\t- ![](${src})`);
         }
 

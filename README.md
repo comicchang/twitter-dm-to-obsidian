@@ -86,7 +86,7 @@ Logseq / Obsidian outliner 格式，无额外 header/footer：
 ```markdown
 - [砍砍.ᐟ](https://x.com/pmamtraveller) [22h](https://x.com/i/status/2027794932224889018)
   - I've made changes to vphone-cli so you can now use the virtual device without a VNC.
-  - 🎬 [视频](https://video.twimg.com/amplify_video/.../xxx.mp4?tag=14)
+  - <video src="https://video.twimg.com/amplify_video/.../xxx.mp4?tag=14" controls style="max-width:480px"></video>
 
 - [作者名](https://x.com/author) [Mar 1](https://x.com/i/status/...)
   - 推文正文第一段
