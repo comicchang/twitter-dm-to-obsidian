@@ -84,23 +84,26 @@ const CONFIG = {
 Logseq / Obsidian outliner 格式，无额外 header/footer：
 
 ```markdown
-- [砍砍.ᐟ](https://x.com/pmamtraveller) [22h](https://x.com/i/status/2027794932224889018)
-  - I've made changes to vphone-cli so you can now use the virtual device without a VNC.
-  - <video src="https://video.twimg.com/amplify_video/.../xxx.mp4?tag=14" controls style="max-width:480px"></video>
+- [砍砍.ᐟ](https://x.com/pmamtraveller) [22h](https://x.com/pmamtraveller/status/2027794932224889018)
+	- I've made changes to vphone-cli so you can now use the virtual device without a VNC.
+	- <video src="https://video.twimg.com/amplify_video/.../xxx.mp4?tag=14" controls style="max-width:480px"></video>
 
-- [作者名](https://x.com/author) [Mar 1](https://x.com/i/status/...)
-  - 推文正文第一段
-  - 推文正文第二段
-  - 🔗 [GitHub - repo/name](https://github.com/...)
+- [作者名](https://x.com/author) [Mar 1](https://x.com/author/status/2027794932224889000)
+	- 推文正文第一段
+	  推文正文第二段
+	- 🔗 [GitHub - repo/name](https://github.com/...)
 
 - 纯文字 DM 内容
 ```
+
+> 子级 bullet 用 **Tab** 缩进（Logseq outliner 约定）；同一段正文的续行不重复 `- ` 前缀，在 Tab 后补两个空格；消息之间用一个无缩进空行分隔。
 
 每条推文包含：
 - **作者显示名**（链接到作者主页）+ **时间戳**（链接到原推文）
 - **正文**（已展开 "Show more"，已清理 t.co / pic.twitter.com 残留引用）
 - **媒体**：视频链接（`video.twimg.com` 长期有效）/ 图片内嵌
 - **额外链接**：t.co 短链自动展开为真实 URL；已过滤推文自身链接、作者 profile 链接和 analytics 链接
+- **引用/回复推文**（仅书签/历史页）：书签/历史页推文若引用或回复另一条推文，被引用/回复推文会展开一层；不再继续展开它自己的引用/回复。DM 页暂不支持展开
 
 ---
 
@@ -108,10 +111,13 @@ Logseq / Obsidian outliner 格式，无额外 header/footer：
 
 - **虚拟列表**：一次只能导出当前已渲染的消息，无法一次性导出全部历史
 - **删除功能**：依赖 JS 模拟鼠标 hover 触发 React 事件，成功率不稳定；失败时请手动删除。删除仅作用于已归档或已确认失效的消息，且需二次点击确认
-- **URI 长度上限**：为规避浏览器/Obsidian 对 custom URI 的截断，单次导出保守控制在约 7000 字符；超出时只归档前面装得下的消息，剩余消息留待下一轮
+- **URI 长度上限**：为规避浏览器/Obsidian 对 custom URI 的截断，限制的是**双层编码后的完整 `obsidian://advanced-uri` URI 长度**（`URI_SOFT_MAX = 7000`，硬上限 `URI_MAX = 7400`），不是正文长度；超限时只导出从前往后装得下的消息前缀，剩余消息留待下一轮
+- **引用层级**：引用/回复推文只展开一层，避免递归引用导致内容和 URI 体积失控
 - **图片**：推文内嵌图片 URL 可能有时效限制；视频 URL（`video.twimg.com`）长期有效
 - **时间戳格式**：显示 Twitter 原始相对时间（`22h` / `Mar 1`），不转换为绝对时间
 - **书签页重定向**：`/i/bookmarks` 已被 X 官方重定向至 `/i/history`，旧 URL 下已导出的历史状态（localStorage 中 `twitter-dm-to-obsidian:exported:/i/bookmarks` 键）不会迁移到新 URL，可能被重复导出
+- **引用/回复展开仅限书签/历史页**：该功能走 fiber 提取路径，只有 `parseBookmarkArticle()` 会填充 `referencedTweet`；DM 页的 `parseMessage()` 走纯 DOM 抓取，不展开引用/回复推文
+- **引用推文媒体缺失**：经 fiber 提取的引用推文包含图片/视频；回复目标与 DOM 回退路径经 oEmbed 补全，oEmbed 不返回媒体，因此这些引用/回复块只有正文和链接
 
 ---
 
@@ -119,7 +125,8 @@ Logseq / Obsidian outliner 格式，无额外 header/footer：
 
 | 版本 | 变更 |
 |------|------|
-| 3.9.5 | **DM 导出修复**：适配新 DOM（无 ul/li，嵌套 div）；`SEL.tweetAuthor` 移除失效的 `data-slot` 要求；`@match` 扩大到 `x.com/*` 解决 GreaseMonkey SPA 导航不注入按钮。**书签页 fiber 提取**：完整正文 + 译文 + 展开 URL；oEmbed 不覆盖已翻译文本。**链接清理**：过滤推文自身/analytics 链接；正文清理 t.co/pic.twitter.com。**格式**：作者名链接到 profile；Logseq outliner 格式对齐（空行无缩进、连续空行归一）。**视觉反馈**：已导出推文降低透明度（0.55）+ 左侧蓝色边框，导出/删除后自动更新 |
+| 3.10.0 | **引用/回复展开（仅书签/历史页）**：书签/历史页推文引用或回复另一条推文时，展开被引用/回复推文正文、媒体和链接；仅展开一层，不递归展开目标推文自己的引用/回复。fiber 优先提取 `quoted_status`/`in_reply_to_status_id_str`，回复目标缺失正文时用 oEmbed 补全（oEmbed 不含媒体）。DM 页解析路径未接入。**结构化 status 链接去重**：过滤指向本条推文自身及其引用/回复目标的冗余 status 链接（作者名、时间戳、媒体、analytics 等），正文中的他人推文链接保留。**长推文**：支持 `note_tweet`，截断的长推文按完整正文导出。**视频格式**：视频媒体导出为 `<video src="..." controls style="max-width:480px"></video>` 内联标签。 |
+| 3.9.5 | **DM 导出修复**：适配新 DOM（无 ul/li，嵌套 div）；`SEL.tweetAuthor` 移除失效的 `data-slot` 要求；`@match` 扩大到 `x.com/*` 解决 GreaseMonkey SPA 导航不注入按钮。**书签页 fiber 提取**：完整正文 + 译文 + 展开 URL；oEmbed 不覆盖已翻译文本。**链接清理**：过滤推文自身/analytics 链接；正文清理 t.co/pic.twitter.com。**格式**：作者名链接到 profile；Logseq outliner 格式对齐（空行无缩进、连续空行归一）。**视觉反馈**：已导出推文降低透明度（0.6）+ 左侧蓝色边框，导出/删除后自动更新 |
 | 3.9.4 | 支持 `/i/history` 新 URL（X 已将 `/i/bookmarks` 重定向至 `/i/history`，历史/书签页均可注入按钮）；`GM_xmlhttpRequest` 请求增加 10 秒超时（t.co 展开与 oEmbed 超时不再拖死导出流程）；导出前先落库 `markMessagesExported` 再导航，保证删除安全门禁可靠；删除冗余 `@connect publish.twitter.com`；补充 `@match` 规则（`/i/chat/*`、`/i/bookmarks*`、`/i/history*`）；更新文档 |
 | 3.9.3 | formatMarkdown 修复：推文正文多行改为嵌套列表（以 `-`、`*`、`1.` 列表标记开头的行缩进为二级 bullet，空行与续行格式归一） |
 | 3.9.2 | 书签页按钮改为注入 h2 标题行容器（标题右侧水平布局）并调整配色；oEmbed 补全正文保留换行；过滤与已提取媒体重复的 `/photo/N`、`/video/N` 链接 |

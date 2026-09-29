@@ -5,9 +5,11 @@
 单文件实现，无构建步骤，无依赖：
 
 ```
-twitter-dm-to-obsidian.user.js   ← 唯一实现文件（Tampermonkey userscript）
-README.md
-CLAUDE.md
+twitter-dm-to-obsidian.user.js   ← 唯一运行时实现文件（Tampermonkey userscript）
+README.md                          ← 安装、配置、使用与排障说明
+CLAUDE.md                          ← 架构与选择器级实现笔记（维护者）
+AGENTS.md                          ← 编码、测试与提交约定
+fix-truncated-tweets.md           ← 修复 Obsidian/Logseq 日记中截断/错缩推文文本的手册
 ```
 
 ## 架构概览
@@ -19,10 +21,12 @@ CLAUDE.md
   └─ tryInjectButtons()          按钮注入（MutationObserver + pushState 劫持；DM 与书签/历史两套锚点）
        ├─ exportToObsidian()     📥 导出流程（DM / 书签页共用，scraper 按页面注入）
        │    ├─ scrapeLoadedMessages() / scrapeBookmarks()
-       │    │    └─ parseMessage() / parseBookmarkArticle()  提取 url/author/time/text/media/extraLinks
+       │    │    ├─ parseMessage()          DM：纯 DOM 抓取 url/author/time/text/media/extraLinks（无 referencedTweet）
+       │    │    └─ parseBookmarkArticle()  书签/历史页：fiber 优先，回退 DOM；额外填充 referencedTweet
        │    ├─ enrichWithOembed()   oEmbed 补全正文（fetchOembedData，批量并发 3，跳过失效推文）
-       │    ├─ resolveExtraLinks()  t.co 短链展开（GM_xmlhttpRequest，5 并发）
-       │    ├─ formatMarkdown()     Logseq outliner 格式化
+       │    ├─ expandReferencedTweets()  展开一层引用/回复推文（仅书签/历史页；quoted_status 直接取，回复目标 oEmbed 补全且无媒体）
+       │    ├─ resolveExtraLinks()  t.co 短链展开（GM_xmlhttpRequest，5 并发；含一层 referencedTweet.extraLinks）
+       │    ├─ formatMarkdown()     Logseq outliner 格式化（引用/回复推文作为嵌套块）
        │    └─ obsidian://advanced-uri  追加到 Daily Note
        ├─ deleteAllMessages()     🗑️ DM 删除流程
        │    └─ deleteSingleMessage()  overflow 按钮 → Popover 删除项 → dialog 确认
@@ -76,7 +80,7 @@ messageItem:  '[data-testid^="message-"]'       // 前缀匹配，UUID后缀
 moreBtn:      '[data-testid="dm-conversation-more-button"]'
 tweetCard:    'a[href*="/status/"]'
 tweetText:    'span[dir="auto"] > span'
-tweetAuthor:  '[data-slot="hover-card-trigger"] [class*="font-bold"]'
+tweetAuthor:  '[class*="font-bold"]'
 tweetTime:    '[class*="text-gray-800"]'         // card内第一个匹配=时间戳
 actionsArea:  '[style*="grid-area: actions"]'    // 旧版回退（新版已弃用）
 bookmarkArticle:   'article[data-testid="tweet"]'       // 书签/历史页：每条书签的根元素
@@ -107,10 +111,11 @@ x.com 的 CSP `connect-src` 不包含 `t.co`，`fetch` 会被阻断。
 DM 卡片只渲染推文预览，正文内的链接（t.co）可能不出现在卡片 DOM 里。
 通过 `publish.twitter.com/oembed`（GM_xmlhttpRequest，publish.twitter.com 由 `@connect *` 通配白名单放行）获取推文完整 HTML：
 
-1. `fetchOembedData(tweetUrl)` 请求 oEmbed，返回 blockquote `<p>` 及其中 t.co 链接列表；4xx 标记 `notFound`（推文已删除 / 不可见 / 账号停用）
+1. `fetchOembedData(tweetUrl)` 请求 oEmbed，返回 blockquote `<p>`、t.co 链接列表和作者信息；仅 404/410 标记 `notFound`，401/403/429 等按临时故障保留原始数据
 2. `enrichWithOembed(messages)` 批量并发 3：t.co `<a>` 从正文移除并加入 extraLinks（交由 resolveExtraLinks 统一展开），@mention / #hashtag 保留纯文字
-3. 失效推文（notFound）跳过归档，但标记为已导出，允许加入待删除集合
-4. 媒体冗余清理：已有图片/视频时移除对应的 `/photo/N`、`/video/N` 链接
+3. `expandReferencedTweets(messages)` 补全顶层消息的 `referencedTweet`：**只有 `parseBookmarkArticle()` 产出该字段**，DM 的 `parseMessage()` 不产出。fiber 的 `quoted_status` 直接展开（含媒体）；回复目标通过 oEmbed 获取正文和链接，**oEmbed 不返回媒体，故这类引用/回复块无图片/视频**。补全结果不携带 `referencedTweet`，所以不会递归展开
+4. 失效推文（notFound）跳过归档，但标记为已导出，允许加入待删除集合
+5. 媒体冗余清理：已有图片/视频时移除对应的 `/photo/N`、`/video/N` 链接
 
 ## 删除机制
 
@@ -141,16 +146,22 @@ Twitter 是 SPA，三重保障：
 
 ## 输出格式
 
-Logseq outliner 格式（无 header/footer）：
+Logseq outliner 格式（无 header/footer）。子级 bullet 用 **Tab** 缩进，续行在 Tab 后补两个空格：
 
 ```markdown
-- 作者名 [22h](https://x.com/i/status/...)
-  - 正文段落
-  - <video src="https://video.twimg.com/..." controls style="max-width:480px"></video>
-  - ![](https://pbs.twimg.com/...)
-  - 🔗 [链接标题](https://github.com/...)
+- [作者名](https://x.com/author) [22h](https://x.com/author/status/...)
+	- 正文段落
+	  续行不重复 `- ` 前缀
+	- 引用 [被引用作者](https://x.com/quoted_author/status/...):
+		- 被引用推文正文
+		- ![](https://pbs.twimg.com/...)     ← 仅 fiber 提取的引用推文有；oEmbed 补全的回复目标无媒体
+	- <video src="https://video.twimg.com/..." controls style="max-width:480px"></video>
+	- ![](https://pbs.twimg.com/...)
+	- 🔗 [链接标题](https://github.com/...)
 
 - 纯文字DM内容
 ```
+
+作者行仅在 `author` 与 `authorUrl` 同时存在时才把作者名渲染成 profile 链接（见 `formatTweetMarkdown`）。
 
 时间戳显示 Twitter 原始相对时间，不转换（`22h` / `Mar 1`）。

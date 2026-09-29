@@ -1,11 +1,14 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-This repository is intentionally minimal and has no build pipeline.
+This repository is intentionally minimal and has no build pipeline. The tracked files are:
 
+- `.gitignore`: excludes local agent-tool state (`.serena/`, `.dotai/`, `.omo/`, `.codex/`, `.memsearch/`, `opencode.json`).
 - `twitter-dm-to-obsidian.user.js`: the only runtime source file (Tampermonkey userscript).
 - `README.md`: installation, configuration, usage, and troubleshooting notes.
 - `CLAUDE.md`: architecture and selector-level implementation notes for maintainers.
+- `AGENTS.md`: this file — coding, testing, and commit conventions.
+- `fix-truncated-tweets.md`: manual playbook for repairing truncated/mis-indented tweet text already written into Obsidian/Logseq journals.
 
 Keep new logic inside the userscript unless a split is clearly justified. Prefer extracting reusable functions over copy-paste.
 
@@ -33,6 +36,7 @@ Automated tests are not configured; regression is manual.
 - Always run `node --check` before opening a PR.
 - Test at least: tweet-card export, plain-text fallback, t.co expansion, and delete confirmation path.
 - If touching URI assembly, verify large payload truncation behavior and vault/folder options.
+- Archive formatting/reindentation repairs require a content-preservation diff after stripping whitespace and list markers; commands and URLs must remain byte-identical.
 
 ## Commit & Pull Request Guidelines
 Observed commit style is concise and action-oriented (e.g., `add ...`, `v3.8.0: ...`). Follow one of these patterns:

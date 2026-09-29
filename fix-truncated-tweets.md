@@ -84,7 +84,7 @@ if stripped.startswith('- ![](') or stripped.startswith('- 🔗') or stripped.st
     # Media or link line — preserve exactly as-is
 ```
 
-### Step 4: Verify
+# 4. Verify
 
 ```bash
 # 1. No truncation
@@ -98,6 +98,8 @@ rg '35B total.*3B active.*parameters.*NVFP4' journals/2026-06-01.md
 # 3. Image count must match pre-fix count
 rg -c '!\[' journals/2026-06-01.md
 ```
+
+**Content-preservation gate for reindentation/format repairs:** compare every repaired line's content after stripping only leading whitespace and list markers against the source or pre-repair baseline. No words, URLs, commands, numbers, or punctuation may change. For shell command blocks, grep the exact command tokens before and after; indentation-only fixes must never alter command text.
 
 ## Common Pitfalls
 

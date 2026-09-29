@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter DM to Obsidian
 // @namespace    https://github.com/comicchang/twitter-dm-to-obsidian
-// @version      3.9.5
+// @version      3.10.0
 // @description  将 Twitter/X DM 消息（转发推文）批量导入 Obsidian，支持删除已载入消息、书签/历史页推文导入与取消收藏
 // @author       comicchang
 // @homepageURL  https://github.com/comicchang/twitter-dm-to-obsidian
@@ -31,7 +31,7 @@
 
   // ─── DOM 选择器 ──────────────────────────────────────────────────────────────
   const SEL = {
-    // DM 消息列表容器（ul 的父级，用于定位已载入消息）
+    // DM 消息列表容器（新版 DOM 为嵌套 div 结构，用于定位已载入消息）
     messageList:  '[data-testid="dm-message-list"]',
     // 单条消息项（data-testid 以 "message-" 开头）
     messageItem:  '[data-testid^="message-"]',
@@ -75,6 +75,129 @@
   // 优势：不截断、有译文、URL 已展开、无需 oEmbed 补全。
 
   /**
+   * 将 Twitter tweet 对象转换为导出消息。
+   * includeReference=false 用于引用/回复推文本身，避免递归展开。
+   */
+  function buildTweetDataFromStatus(v, includeReference = true) {
+    if (!v || typeof v !== 'object' || !v.user?.screen_name) return null;
+
+    // 媒体：先于正文计算，纯媒体推文（无 full_text）同样要能被导出
+    const media = [];
+    for (const m of (v.extended_entities?.media || v.entities?.media || [])) {
+      if (m.type === 'video' || m.type === 'animated_gif') {
+        const best = (m.video_info?.variants || [])
+          .filter(vr => vr.content_type === 'video/mp4')
+          .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+        if (best) media.push({ type: 'video', src: best.url });
+      } else if (m.type === 'photo') {
+        media.push({ type: 'image', src: m.media_url_https || m.media_url });
+      }
+    }
+
+    // 正文候选：译文（Grok 翻译）→ 长推文 → 扩展推文 → 原文
+    const rawText = v.grok_translated_post?.translation
+      || v.note_tweet?.text
+      || v.extended_tweet?.full_text
+      || v.full_text
+      || '';
+    // 既无正文也无媒体的 fiber prop 不是推文
+    if (!rawText && !media.length) return null;
+
+    // permalink 与 id_str 都缺失时不能拼出 /status/undefined：整条候选丢弃
+    if (!v.permalink && !v.id_str) return null;
+
+    const tweetUrl = v.permalink
+      ? `https://x.com${v.permalink}`
+      : `https://x.com/${v.user.screen_name}/status/${v.id_str}`;
+    const tweetId = v.id_str || '';
+    const authorUrl = `https://x.com/${v.user.screen_name}`;
+
+    // 译文（Grok 翻译）
+    const translatedText = v.grok_translated_post?.translation || null;
+    const lang = v.lang || '';
+
+    // 展开后的 URL（优先用译文实体的，其次用长推文实体的，最后用原文实体的）
+    // 空数组同样算“没有实体”：|| 会被 [] 短路，回退不到后面的来源
+    const urlEntities = [
+      v.grok_translated_post?.entities?.urls,
+      v.note_tweet?.entity_set?.urls,
+      v.entities?.urls,
+    ].find(list => Array.isArray(list) && list.length) || [];
+    const expandedUrls = urlEntities.map(u => u.expanded_url).filter(Boolean);
+
+    // 额外链接：entities 中的展开 URL，排除推文自身和作者链接
+    const extraLinks = [];
+    const cardUrl = v.card?.url || '';
+    const cardExpanded = urlEntities.find(u => u.url === cardUrl)?.expanded_url;
+    if (cardExpanded) {
+      const label = v.card?.binding_values?.title?.string_value || '';
+      extraLinks.push({ href: cardExpanded, label });
+    }
+    for (const u of expandedUrls) {
+      if (u === cardExpanded) continue; // 已通过 card 添加
+      if (u === tweetUrl || u === authorUrl) continue;
+      // 过滤指向同一条推文的链接（/video/N、/photo/N 等）
+      if (tweetId && new RegExp(`/status/${tweetId}(/|$)`).test(u)) continue;
+      extraLinks.push({ href: u, label: '' });
+    }
+
+    // 时间（显示原始相对时间，与 Twitter UI 一致）
+    const time = v.created_at
+      ? formatRelativeTime(v.created_at)
+      : '';
+
+    // 清理正文中的 t.co/pic.twitter.com 引用（展开 URL 已在 extraLinks 中）
+    const displayText = rawText
+      .replace(/\s*(?:https?:\/\/)?t\.co\/\S+/g, '')
+      .replace(/\s*(?:https?:\/\/)?pic\.twitter\.com\/\S+/g, '')
+      .trim();
+
+    return {
+      url: tweetUrl,
+      authorUrl,
+      author: v.user.name || '',
+      time,
+      text: displayText,
+      media,
+      extraLinks,
+      translatedText,
+      lang,
+      isFromFiber: true,
+      referencedTweet: includeReference ? extractReferencedTweetFromStatus(v) : null,
+    };
+  }
+
+  /**
+   * 只提取一层引用/回复推文：
+   * - 引用推文 fiber 中有 quoted_status，直接展开（needsFetch=false，数据已完整）；
+   * - 回复推文只有 in_reply_to_status_id_str，返回 URL 供 oEmbed 补全（needsFetch=true）。
+   * needsFetch 取代“正文为空即未抓取”的猜测：fiber 引用的正文可能被清空但媒体完整。
+   */
+  function extractReferencedTweetFromStatus(v) {
+    if (v.quoted_status) {
+      const quotedData = buildTweetDataFromStatus(v.quoted_status, false);
+      if (quotedData) return { relation: 'quote', ...quotedData, needsFetch: false };
+      // quoted_status 缺字段时退回 URL + oEmbed 补全，避免整条引用被丢弃
+      const quoted = v.quoted_status;
+      const quotedUrl = quoted.permalink
+        ? `https://x.com${quoted.permalink}`
+        : (quoted.id_str && quoted.user?.screen_name ? `https://x.com/${quoted.user.screen_name}/status/${quoted.id_str}` : '');
+      if (quotedUrl) return { relation: 'quote', url: quotedUrl, needsFetch: true };
+    }
+
+    const replyId = v.in_reply_to_status_id_str || '';
+    const replyScreen = v.in_reply_to_screen_name || '';
+    if (replyId && replyScreen) {
+      return {
+        relation: 'reply',
+        url: `https://x.com/${replyScreen}/status/${replyId}`,
+        needsFetch: true,
+      };
+    }
+    return null;
+  }
+
+  /**
    * 从推文 DOM 元素的 React fiber 中提取完整数据
    * @param {Element} el - article[data-testid="tweet"] 或含推文数据的 DOM 元素
    * @returns {Object|null} 兼容 parseMessage 返回格式的对象，附带 translatedText/lang/isFromFiber
@@ -83,95 +206,33 @@
     const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
     if (!fiberKey) return null;
 
+    const candidates = [];
     let walk = el[fiberKey];
     for (let depth = 0; depth < 25 && walk; depth++) {
       const mp = walk.memoizedProps;
       if (!mp) { walk = walk.return; continue; }
 
       for (const key of Object.keys(mp)) {
-        const v = mp[key];
-        if (!v || typeof v !== 'object' || !v.full_text) continue;
-        if (!v.user?.screen_name) continue;
-
-        const tweetUrl = v.permalink
-          ? `https://x.com${v.permalink}`
-          : `https://x.com/${v.user.screen_name}/status/${v.id_str}`;
-        const tweetId = v.id_str || '';
-        const authorUrl = `https://x.com/${v.user.screen_name}`;
-
-        // 译文（Grok 翻译）
-        const translatedText = v.grok_translated_post?.translation || null;
-        const lang = v.lang || '';
-
-        // 展开后的 URL（优先用译文实体的，其次用长推文实体的，最后用原文实体的）
-        const urlEntities = v.grok_translated_post?.entities?.urls
-          || v.note_tweet?.entity_set?.urls
-          || v.entities?.urls
-          || [];
-        const expandedUrls = urlEntities.map(u => u.expanded_url).filter(Boolean);
-
-        // 媒体
-        const media = [];
-        for (const m of (v.extended_entities?.media || v.entities?.media || [])) {
-          if (m.type === 'video' || m.type === 'animated_gif') {
-            const best = (m.video_info?.variants || [])
-              .filter(vr => vr.content_type === 'video/mp4')
-              .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-            if (best) media.push({ type: 'video', src: best.url });
-          } else if (m.type === 'photo') {
-            media.push({ type: 'image', src: m.media_url_https || m.media_url });
-          }
-        }
-
-        // 额外链接：entities 中的展开 URL，排除推文自身和作者链接
-        const extraLinks = [];
-        const cardUrl = v.card?.url || '';
-        const cardExpanded = urlEntities.find(u => u.url === cardUrl)?.expanded_url;
-        if (cardExpanded) {
-          const label = v.card?.binding_values?.title?.string_value || '';
-          extraLinks.push({ href: cardExpanded, label });
-        }
-        for (const u of expandedUrls) {
-          if (u === cardExpanded) continue; // 已通过 card 添加
-          if (u === tweetUrl || u === authorUrl) continue;
-          // 过滤指向同一条推文的链接（/video/N、/photo/N 等）
-          if (tweetId && new RegExp(`/status/${tweetId}(/|$)`).test(u)) continue;
-          extraLinks.push({ href: u, label: '' });
-        }
-
-        // 时间（显示原始相对时间，与 Twitter UI 一致）
-        const time = v.created_at
-          ? formatRelativeTime(v.created_at)
-          : '';
-
-        // 清理正文中的 t.co/pic.twitter.com 引用（展开 URL 已在 extraLinks 中）
-        // 长推文（Twitter Blue）优先用 note_tweet.text，其次 extended_tweet.full_text
-        const rawText = translatedText
-          || v.note_tweet?.text
-          || v.extended_tweet?.full_text
-          || v.full_text
-          || '';
-        const displayText = rawText
-          .replace(/\s*https?:\/\/t\.co\/\S+/g, '')
-          .replace(/\s*pic\.twitter\.com\/\S+/g, '')
-          .trim();
-
-        return {
-          url: tweetUrl,
-          authorUrl,
-          author: v.user.name || '',
-          time,
-          text: displayText,
-          media,
-          extraLinks,
-          translatedText,
-          lang,
-          isFromFiber: true,
-        };
+        const data = buildTweetDataFromStatus(mp[key], true);
+        if (data) candidates.push(data);
       }
       walk = walk.return;
     }
-    return null;
+
+    const domStatusId = statusIdFromUrl(el.querySelector('a[href*="/status/"]')?.href || '');
+    // 按 status ID 精确匹配，避免 1234 误命中 /status/12345 这类子串
+    const domMatch = candidates.find(d => domStatusId && statusIdFromUrl(d.url) === domStatusId);
+    if (domMatch) return domMatch;
+
+    // 没有 DOM 状态锚点时，candidates[0] 可能是被引用的那条（fiber 深处先于本体被遍历到）：
+    // 被其它候选当作引用目标的 status ID 视为引用，优先取未被引用的那条
+    const referencedIds = new Set(
+      candidates.map(d => statusIdFromUrl(d.referencedTweet?.url || '')).filter(Boolean)
+    );
+    return candidates.find(d => {
+      const id = statusIdFromUrl(d.url);
+      return id && !referencedIds.has(id);
+    }) || candidates[0] || null;
   }
 
   /**
@@ -255,12 +316,21 @@
    * 限制并发为 5，避免触发速率限制
    */
   async function resolveExtraLinks(messages) {
-    // 收集所有需要展开的唯一 t.co URL
-    const tcoUrls = [...new Set(
-      messages.flatMap(m => (m.extraLinks || []).map(l => l.href).filter(h => h.includes('t.co/')))
-    )];
+    // 用缓存结果替换 extraLinks 中的 href，并按最终 URL 去重（DOM + oEmbed 来源可能重叠）
+    const dedupeExpandedLinks = links => {
+      const seen = new Set();
+      return (links || [])
+        .map(link => ({ ...link, href: urlCache.get(link.href) ?? link.href }))
+        .filter(l => seen.has(l.href) ? false : seen.add(l.href));
+    };
 
-    if (!tcoUrls.length) return messages;
+    // 收集所有需要展开的唯一 t.co URL（包括一层引用/回复推文）
+    const tcoUrls = [...new Set(
+      messages.flatMap(m => [
+        ...(m.extraLinks || []),
+        ...(m.referencedTweet?.extraLinks || []),
+      ].map(l => l.href).filter(h => h.includes('t.co/')))
+    )];
 
     // 分批并发（每批 5 个）
     const BATCH = 5;
@@ -268,18 +338,13 @@
       await Promise.all(tcoUrls.slice(i, i + BATCH).map(u => expandTcoUrl(u)));
     }
 
-    // 用缓存结果替换 extraLinks 中的 href，并按最终 URL 去重（DOM + oEmbed 来源可能重叠）
-    return messages.map(msg => {
-      const expanded = (msg.extraLinks || []).map(link => ({
-        ...link,
-        href: urlCache.get(link.href) ?? link.href,
-      }));
-      const seen = new Set();
-      return {
-        ...msg,
-        extraLinks: expanded.filter(l => seen.has(l.href) ? false : seen.add(l.href)),
-      };
-    });
+    return messages.map(msg => ({
+      ...msg,
+      extraLinks: dedupeExpandedLinks(msg.extraLinks),
+      referencedTweet: msg.referencedTweet
+        ? { ...msg.referencedTweet, extraLinks: dedupeExpandedLinks(msg.referencedTweet.extraLinks) }
+        : msg.referencedTweet,
+    }));
   }
 
   // ─── oEmbed 补全 ─────────────────────────────────────────────────────────────
@@ -287,30 +352,69 @@
   // DM 卡片只渲染推文预览，正文内的链接（t.co）可能不出现在卡片 DOM 里。
   // 通过 publish.twitter.com/oembed 获取推文完整 HTML，展开 t.co 后更新正文文字。
 
+  /** 清理 oEmbed 正文：t.co 链接移除，@mention/#hashtag 保留显示文字。 */
+  function cleanOembedText(p) {
+    // oEmbed 用 <br> 编码正文换行：先换成换行文本节点，否则 textContent 会把多行挤成一行
+    for (const br of [...p.querySelectorAll('br')]) {
+      br.replaceWith(document.createTextNode('\n'));
+    }
+    for (const a of [...p.querySelectorAll('a[href]')]) {
+      a.replaceWith(document.createTextNode(
+        a.href.includes('t.co/') ? '' : a.textContent
+      ));
+    }
+    return p.textContent
+      .replace(/[^\S\n]+/g, ' ')   // 合并空格/制表符，保留换行
+      .replace(/^ +| +$/gm, '')      // 去除行首行尾空格
+      .replace(/\n{3,}/g, '\n\n')  // 最多保留两个连续换行
+      .replace(/\s*(?:https?:\/\/)?t\.co\/\S+/g, '')   // 去除残余 t.co 短链文本
+      .replace(/\s*(?:https?:\/\/)?pic\.twitter\.com\/\S+/g, '')   // 去除 pic.twitter.com 引用
+      .trim();
+  }
+
   /**
-   * 获取单条推文 oEmbed 的 blockquote <p> 元素及其中的 t.co 链接列表
-   * 返回 { p: Element, tcoLinks: string[] } 或 null
+   * 获取单条推文 oEmbed 的 blockquote <p> 元素、t.co 链接和基础作者信息。
+   * notFound 只表示 404/410：限流、鉴权、区域屏蔽等都是临时故障，
+   * 当成“已删除”会让 enrichWithOembed 丢弃消息并被 markMessagesExported 记为已归档。
    */
   async function fetchOembedData(tweetUrl) {
     return new Promise(resolve => {
-      GM_xmlhttpRequest({
+      // GM 桥接缺失/被拦截时 GM_xmlhttpRequest 会同步抛错，Promise 构造器会转成 reject
+      // 沿调用链冒泡，把导出按钮永久卡在“抓取中”。这里兜住后按网络错误处理：保留原始数据
+      const request = details => {
+        try {
+          GM_xmlhttpRequest(details);
+        } catch (err) {
+          console.warn('[oembed] GM_xmlhttpRequest 抛出异常:', err);
+          resolve(null);
+        }
+      };
+      request({
         method: 'GET',
         url: `https://publish.twitter.com/oembed?url=${encodeURIComponent(tweetUrl)}&omit_script=true`,
         timeout: GM_REQUEST_TIMEOUT_MS,
         ontimeout: () => resolve(null), // 超时按网络错误处理：保留原始数据
         onload: r => {
-          // 4xx：推文已删除 / 不可见 / 账号停用，标记为 notFound 供调用方过滤
-          if (r.status >= 400 && r.status < 500) return resolve({ notFound: true });
+          // 仅 404/410 表示推文确实已删除 / 不可见
+          if (r.status === 404 || r.status === 410) return resolve({ notFound: true });
+          // 其余非 2xx（401/403/429/451 等）一律按临时故障处理：保留原始数据
+          if (r.status < 200 || r.status >= 300) return resolve(null);
           try {
-            const { html } = JSON.parse(r.responseText);
+            const payload = JSON.parse(r.responseText);
             const tmp = document.createElement('div');
-            tmp.innerHTML = html;
+            tmp.innerHTML = payload.html || '';
             const p = tmp.querySelector('blockquote p');
             if (!p) return resolve(null);
             const tcoLinks = [...p.querySelectorAll('a[href]')]
               .map(a => a.href)
               .filter(h => h.includes('t.co/'));
-            resolve({ p, tcoLinks });
+            resolve({
+              p,
+              tcoLinks,
+              author: payload.author_name || '',
+              authorUrl: payload.author_url || '',
+              url: payload.url || tweetUrl,
+            });
           } catch {
             resolve(null);
           }
@@ -320,18 +424,53 @@
     });
   }
 
+  // 引用推文 oEmbed 结果缓存：同一 URL 被多次引用时只发一次请求（key → Promise）
+  const referencedTweetCache = new Map();
+
+  /**
+   * 用 oEmbed 补全一条引用/回复目标推文。
+   * 只返回 oEmbed 能权威给出的字段：媒体与时间不在其中，避免把 fiber 已有数据覆盖成空。
+   * 返回的 referencedTweet 不再携带 referencedTweet，天然只展开一层。
+   */
+  function fetchTweetFromOembed(tweetUrl) {
+    if (!tweetUrl) return Promise.resolve(null);
+    const cached = referencedTweetCache.get(tweetUrl);
+    if (cached) return cached;
+
+    const pending = fetchOembedData(tweetUrl).then(data => {
+      if (!data || data.notFound) {
+        // 失败不写缓存：限流/抖动只影响本轮，下次仍可重试
+        referencedTweetCache.delete(tweetUrl);
+        return null;
+      }
+      const tweet = { url: data.url || tweetUrl };
+      if (data.author) tweet.author = data.author;
+      if (data.authorUrl) tweet.authorUrl = data.authorUrl;
+      tweet.text = cleanOembedText(data.p);
+      tweet.extraLinks = (data.tcoLinks || []).map(href => ({ href, label: '' }));
+      return tweet;
+    }, () => {
+      referencedTweetCache.delete(tweetUrl);
+      return null;
+    });
+    referencedTweetCache.set(tweetUrl, pending);
+    return pending;
+  }
+
   /**
    * 用 oEmbed 数据更新每条推文的正文（批量并发 3）：
+   * - 只处理非 fiber 消息：fiber 的正文/媒体/展开 URL 已是权威数据，不再请求也不覆盖
    * - t.co 链接从正文中移除，加入 extraLinks 由 resolveExtraLinks 统一展开
    * - @mention / #hashtag 保留为纯文字
    * 返回 { messages, skippedMessageKeys }：
    * - messages：仍可参与归档的消息
-   * - skippedMessageKeys：推文已失效，归档时跳过，但允许加入待删除集合
+   * - skippedMessageKeys：推文已失效（404/410），归档时跳过，但允许加入待删除集合
    */
   async function enrichWithOembed(messages) {
     const BATCH = 3;
     const result = messages.map(m => ({ ...m, extraLinks: [...(m.extraLinks || [])] }));
-    const tweetItems = result.filter(m => m.url);
+    // fiber 消息不请求 oEmbed：正文/媒体/展开 URL 在 fiber 里已是权威数据
+    const tweetItems = result.filter(m => m.url && !m.isFromFiber);
     const skippedMessageKeys = [];
 
     for (let i = 0; i < tweetItems.length; i += BATCH) {
@@ -345,49 +484,53 @@
         }
 
         const { p, tcoLinks } = data;
-
-        // t.co <a> → 从文字中移除；其余 <a>（@mention/#hashtag）→ 保留显示文字
-        for (const a of [...p.querySelectorAll('a[href]')]) {
-          a.replaceWith(document.createTextNode(
-            a.href.includes('t.co/') ? '' : a.textContent
-          ));
-        }
-
-        // 更新正文（保留换行，只合并行内多余空格，清理残余 t.co/pic.twitter.com 引用）
-        const cleaned = p.textContent
-          .replace(/[^\S\n]+/g, ' ')   // 合并空格/制表符，保留换行
-          .replace(/^ +| +$/gm, '')      // 去除行首行尾空格
-          .replace(/\n{3,}/g, '\n\n')  // 最多保留两个连续换行
-          .replace(/\s*https?:\/\/t\.co\/\S+/g, '')   // 去除残余 t.co 短链文本
-          .replace(/\s*pic\.twitter\.com\/\S+/g, '')   // 去除 pic.twitter.com 引用
-          .trim();
-        // fiber 已提供完整正文（含译文），跳过 oEmbed 覆盖
-        if (cleaned && !msg.isFromFiber) msg.text = cleaned;
-
-        // t.co 链接加入 extraLinks（fiber 消息跳过：fiber 自带权威链接，oEmbed 是冗余+污染源）
-        if (!msg.isFromFiber) {
-          for (const href of tcoLinks) {
-            msg.extraLinks.push({ href, label: '' });
-          }
+        const cleaned = cleanOembedText(p);
+        if (cleaned) msg.text = cleaned;
+        for (const href of tcoLinks) {
+          msg.extraLinks.push({ href, label: '' });
         }
       }));
     }
 
-    // 过滤冗余链接：如果 media 已有图片/视频，移除对应的 /photo/N 和 /video/N 链接
+    // 过滤冗余链接：只丢弃指向本条推文自身的 /photo/N、/video/N 链接
     for (const msg of result) {
       if (msg._skip) continue;
       const hasMedia = (msg.media || []).length > 0;
       if (!hasMedia) continue;
-      msg.extraLinks = (msg.extraLinks || []).filter(l =>
-        !/\/photo\/\d+(?:\?|$)/.test(l.href) &&
-        !/\/video\/\d+(?:\?|$)/.test(l.href)
-      );
+      msg.extraLinks = (msg.extraLinks || []).filter(l => !isOwnMediaPermalink(l.href, msg.url));
     }
 
     return {
       messages: result.filter(m => !m._skip),
       skippedMessageKeys,
     };
+  }
+
+  /**
+   * 补全 fiber 中只有 URL 的回复目标推文。
+   * 只处理 messages[].referencedTweet，不再读取补全结果的 referencedTweet，因此只展开一层。
+   */
+  async function expandReferencedTweets(messages) {
+    // 只补全只有 URL 的引用（回复目标 / DOM 回退）；fiber 引用已完整，不再重复请求
+    const pending = messages.filter(m => m.referencedTweet?.url && m.referencedTweet.needsFetch);
+    const BATCH = 3;
+
+    for (let i = 0; i < pending.length; i += BATCH) {
+      await Promise.all(pending.slice(i, i + BATCH).map(async msg => {
+        const fetched = await fetchTweetFromOembed(msg.referencedTweet.url);
+        if (!fetched) return;
+        // 补全后清掉 needsFetch：下游不会再把它当成待补全引用
+        msg.referencedTweet = { ...msg.referencedTweet, ...fetched, needsFetch: false };
+      }));
+    }
+
+    for (const msg of messages) {
+      const ref = msg.referencedTweet;
+      if (!ref || !(ref.media || []).length) continue;
+      ref.extraLinks = (ref.extraLinks || []).filter(l => !isOwnMediaPermalink(l.href, ref.url));
+    }
+
+    return messages;
   }
 
   // ─── 消息提取 ────────────────────────────────────────────────────────────────
@@ -478,7 +621,7 @@
     if (!msgList) return [];
 
     const result = [];
-    for (const msgEl of msgList.querySelectorAll('[data-testid^="message-"]')) {
+    for (const msgEl of msgList.querySelectorAll(SEL.messageItem)) {
       const testid = msgEl.getAttribute('data-testid') || '';
       // 跳过纯文本消息、按钮、表情反应等非主消息元素
       if (testid.startsWith('message-text-')) continue;
@@ -515,56 +658,158 @@
   //
   // Logseq outliner 格式（子 bullet 用 tab 缩进）：
   //
-  // - 作者名 [Mar 1](https://x.com/i/status/...)
+  // - 作者名 [Mar 1](https://x.com/<author>/status/<id>)
   // \t- 推文正文（多行文本合并为单条 bullet）
   // \t- <video src="https://video.twimg.com/..." controls></video>
   // \t- 🔗 [链接标题](https://...)
   //
   // - 纯文字消息内容
 
+  function statusIdFromUrl(url = '') {
+    return (url.match(/\/status\/(\d+)/) || [])[1] || '';
+  }
+
+  /**
+   * 判断链接是否是该推文自身的 /photo/N、/video/N 永久链接。
+   * 只按 status ID 精确比对：别人推文的媒体链接是正文里的合法内容，不能顺带删掉。
+   */
+  function isOwnMediaPermalink(href, tweetUrl) {
+    const id = statusIdFromUrl(tweetUrl);
+    if (!id) return false;
+    return new RegExp(`/status/${id}/(?:photo|video)/\\d+(?:[?#]|$)`).test(href || '');
+  }
+
+  /**
+   * 结构化推文 URL 已由作者/时间戳或引用块呈现，不能再作为裸 extraLinks 重复输出；
+   * 同一 href 在父级与引用级重复出现时只保留父级那条。
+   * 提前过滤可以省掉对死链的 t.co 展开请求，formatMarkdown 再调用一次仅作兜底。
+   * 比较 status ID 以兼容 x.com/twitter.com 和查询参数差异。
+   */
+  function withoutStructuralStatusLinks(message) {
+    const structuralIds = new Set(
+      [message.url, message.referencedTweet?.url]
+        .map(statusIdFromUrl)
+        .filter(Boolean)
+    );
+    // 父级与引用级共用一个 seen 集合，按父级先、引用的顺序去重
+    const seenHrefs = new Set();
+    const filterLinks = links => (links || []).filter(link => {
+      const href = link?.href;
+      if (!href) return false;
+      if (structuralIds.has(statusIdFromUrl(href))) return false;
+      if (seenHrefs.has(href)) return false;
+      seenHrefs.add(href);
+      return true;
+    });
+
+    return {
+      ...message,
+      extraLinks: filterLinks(message.extraLinks),
+      referencedTweet: message.referencedTweet
+        ? { ...message.referencedTweet, extraLinks: filterLinks(message.referencedTweet.extraLinks) }
+        : message.referencedTweet,
+    };
+  }
+
+  // 列表标记：`-`/`*` 项与 1-2 位数字的有序项（避免把 "2024. prose" 误判为列表）
+  const LIST_MARKER_RE = /^(?:[-*] |\d{1,2}\. )/;
+
+  function formatTextLines(text, indent) {
+    let prevBlank = false;
+    return text.split('\n').map((line, idx) => {
+      const trimmed = line.trimEnd();
+      // 列表标记先于首行判断：首行列表项与作者行同层渲染成 "- item"（否则会变成 "- - item"），
+      // 续行列表项才下沉一层成 "\t- item"
+      if (LIST_MARKER_RE.test(trimmed)) {
+        prevBlank = false;
+        const item = trimmed.replace(LIST_MARKER_RE, '');
+        return idx === 0 ? `${indent}- ${item}` : `${indent}\t- ${item}`;
+      }
+      if (idx === 0) { prevBlank = false; return `${indent}- ${line}`; }
+      if (trimmed === '') {
+        if (prevBlank) return null; // 连续空行归一
+        prevBlank = true;
+        return '';
+      }
+      prevBlank = false;
+      return `${indent}  ${line}`;
+    }).filter(l => l !== null).join('\n');
+  }
+
+  function relationLabel(relation) {
+    if (relation === 'quote') return '引用 ';
+    if (relation === 'reply') return '回复 ';
+    return '引用/回复 ';
+  }
+
+  function formatTweetMarkdown(message, indent = '', label = '', allowReference = true) {
+    const {
+      url,
+      author = '',
+      authorUrl = '',
+      time = '',
+      text = '',
+      media = [],
+      extraLinks = [],
+      referencedTweet = null,
+    } = message;
+    const lines = [];
+
+    if (label) {
+      // 引用/回复块沿用历史存档格式：作者名直接链接到目标推文
+      lines.push(`${indent}- ${label}[${author || 'Tweet'}](${url}):`);
+    } else {
+      // 第一行：作者名链接到 profile，时间戳链接到推文
+      const timeLink = `[${time || 'Tweet'}](${url})`;
+      const authorDisplay = author && authorUrl ? `[${author}](${authorUrl})` : author;
+      lines.push(`${indent}- ${author ? `${authorDisplay} ` : ''}${timeLink}`);
+    }
+
+    // 正文：多行文本按 nested list 处理；空行保持为空，连续空行归一
+    if (text) lines.push(formatTextLines(text, `${indent}\t`));
+
+    // 引用/回复推文只在顶层展开一层；被展开推文自身的 referencedTweet 被忽略
+    if (allowReference && referencedTweet?.url) {
+      const hasBody = referencedTweet.text
+        || (referencedTweet.media || []).length
+        || (referencedTweet.extraLinks || []).length;
+      if (hasBody) {
+        lines.push(...formatTweetMarkdown(
+          referencedTweet,
+          `${indent}\t`,
+          relationLabel(referencedTweet.relation),
+          false
+        ));
+      } else {
+        // 补全失败：退化成关系 + 链接的单行，不输出空的引用块
+        const refTarget = referencedTweet.author
+          ? `[${referencedTweet.author}](${referencedTweet.url})`
+          : referencedTweet.url;
+        lines.push(`${indent}\t- ${relationLabel(referencedTweet.relation)}${refTarget}`);
+      }
+    }
+
+    // 媒体
+    for (const { type, src } of media) {
+      if (type === 'video') lines.push(`${indent}\t- <video src="${src}" controls style="max-width:480px"></video>`);
+      else lines.push(`${indent}\t- ![](${src})`);
+    }
+
+    // 额外链接
+    for (const { href, label: linkLabel } of extraLinks) {
+      lines.push(`${indent}\t- 🔗 ${linkLabel ? `[${linkLabel}](${href})` : href}`);
+    }
+
+    return lines;
+  }
+
   function formatMarkdown(messages) {
     const lines = [];
 
-    for (const { url, author = '', authorUrl = '', time = '', text, media = [], extraLinks = [] } of messages) {
-      if (url) {
-        // 第一行：作者名链接到 profile，时间戳链接到推文
-        const timeLink = `[${time || 'Tweet'}](${url})`;
-        const authorDisplay = author && authorUrl ? `[${author}](${authorUrl})` : author;
-        lines.push(`- ${author ? `${authorDisplay} ` : ''}${timeLink}`);
-
-        // 正文：合并为单条子 bullet，多行文本按 nested list 处理
-        // 空行保持为空（Logseq 规范：空行无缩进），连续空行归一
-        if (text) {
-          let prevBlank = false;
-          const formatted = text.split('\n').map((line, idx) => {
-            if (idx === 0) { prevBlank = false; return `\t- ${line}`; }
-            const trimmed = line.trimEnd();
-            if (/^[-*] |^\d+\. /.test(trimmed)) { prevBlank = false; return `\t\t- ${trimmed.replace(/^[-*] |^\d+\. /, '')}`; }
-            if (trimmed === '') {
-              if (prevBlank) return null; // 连续空行归一
-              prevBlank = true;
-              return '';
-            }
-            prevBlank = false;
-            return `\t  ${line}`;
-          }).filter(l => l !== null).join('\n');
-          lines.push(formatted);
-        }
-
-        // 媒体
-        for (const { type, src } of media) {
-          if (type === 'video') lines.push(`\t- <video src="${src}" controls style="max-width:480px"></video>`);
-          else lines.push(`\t- ![](${src})`);
-        }
-
-        // 额外链接
-        for (const { href, label } of extraLinks) {
-          lines.push(`\t- 🔗 ${label ? `[${label}](${href})` : href}`);
-        }
-      } else {
-        // 纯文字消息（无推文卡片，直接顶级 bullet）
-        lines.push(`- ${text}`);
-      }
+    for (const rawMessage of messages) {
+      const message = withoutStructuralStatusLinks(rawMessage);
+      if (message.url) lines.push(...formatTweetMarkdown(message));
+      else lines.push(`- ${message.text}`);
       lines.push('');
     }
 
@@ -677,6 +922,12 @@
     return CONFIG.debug ? '📥 Obsidian [D]' : '📥 Obsidian';
   }
 
+  // 删除按钮的空闲文案随页面不同（DM：删除已载入；书签：取消收藏），
+  // 确认态取消与状态复位都必须回到它，写死文案会把书签按钮的标签改坏
+  function getDeleteButtonIdleLabel(deleteBtn) {
+    return deleteBtn?.dataset?.idleLabel || '🗑️ 删除已载入';
+  }
+
   function setButtonStatus(btn, label, { disabled = false, resetTo = '', resetMs = BUTTON_STATUS_RESET_MS, onReset } = {}) {
     if (!btn) return;
     clearTimeout(btn._statusTimer);
@@ -696,7 +947,7 @@
     deleteBtn.dataset.confirmDelete = '';
     deleteBtn.dataset.confirmDeleteCount = '';
     if (syncGuard) {
-      deleteBtn.textContent = '🗑️ 删除已载入';
+      deleteBtn.textContent = getDeleteButtonIdleLabel(deleteBtn);
       syncDeleteGuard(deleteBtn);
     }
   }
@@ -736,11 +987,12 @@
     return buildObsidianUri('\n' + formatMarkdown([message])).length;
   }
 
-  function buildOverflowNote({ textTrimmed, removedMediaCount, removedLinkCount }) {
+  function buildOverflowNote({ textTrimmed, removedMediaCount, removedLinkCount, removedReference }) {
     const parts = [];
     if (textTrimmed) parts.push('正文已截断');
     if (removedMediaCount > 0) parts.push(`省略${removedMediaCount}个媒体`);
     if (removedLinkCount > 0) parts.push(`省略${removedLinkCount}条链接`);
+    if (removedReference) parts.push('引用已省略');
     if (!parts.length) return '';
     return `[内容过长，${parts.join('，')}]`;
   }
@@ -757,22 +1009,52 @@
   }
 
   // 单条消息超限时，尽量降级成一个可归档版本，避免卡住后续“先归档再删除”的循环。
+  // 降级顺序：父级链接 → 引用链接 → 父级媒体 → 引用媒体 → 引用正文 → 父级正文 → 整块引用丢弃。
+  // 单条超长引用因此不会永久卡住整轮导出：最后总能退化成一条带原推文链接的最小记录。
   function fitSingleMessageWithinLimit(message) {
     const originalMedia = [...(message.media || [])];
     const originalLinks = [...(message.extraLinks || [])];
     const originalText = message.text || '';
+    const reference = message.referencedTweet || null;
+    const refMedia = [...(reference?.media || [])];
+    const refLinks = [...(reference?.extraLinks || [])];
+    const refText = reference?.text || '';
 
     let removedMediaCount = 0;
     let removedLinkCount = 0;
     let textTrimmed = false;
     let textLimit = originalText.length;
+    let removedRefMediaCount = 0;
+    let removedRefLinkCount = 0;
+    let refTextTrimmed = false;
+    let refTextLimit = refText.length;
+    let referenceDropped = false;
 
     function buildCandidate() {
-      const note = buildOverflowNote({ textTrimmed, removedMediaCount, removedLinkCount });
+      const note = buildOverflowNote({
+        textTrimmed,
+        removedMediaCount,
+        removedLinkCount,
+        removedReference: referenceDropped,
+      });
       const media = originalMedia.slice(0, originalMedia.length - removedMediaCount);
       const extraLinks = originalLinks.slice(0, originalLinks.length - removedLinkCount);
       const text = buildTruncatedText(originalText, textLimit, note);
-      return { ...message, media, extraLinks, text };
+      // 引用降到最小时只剩 header + 链接；再不行就整块丢弃
+      const referencedTweet = (!reference || referenceDropped)
+        ? null
+        : {
+          ...reference,
+          media: refMedia.slice(0, refMedia.length - removedRefMediaCount),
+          extraLinks: refLinks.slice(0, refLinks.length - removedRefLinkCount),
+          text: buildTruncatedText(refText, refTextLimit, buildOverflowNote({
+            textTrimmed: refTextTrimmed,
+            removedMediaCount: removedRefMediaCount,
+            removedLinkCount: removedRefLinkCount,
+          })),
+          needsFetch: false,
+        };
+      return { ...message, media, extraLinks, text, referencedTweet };
     }
 
     let candidate = buildCandidate();
@@ -784,19 +1066,47 @@
       if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
     }
 
+    while (removedRefLinkCount < refLinks.length) {
+      removedRefLinkCount++;
+      candidate = buildCandidate();
+      if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
+    }
+
     while (removedMediaCount < originalMedia.length) {
       removedMediaCount++;
       candidate = buildCandidate();
       if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
     }
 
-    if (originalText) {
-      textTrimmed = true;
-      while (textLimit > 280) {
-        textLimit = Math.max(280, textLimit - 200);
+    while (removedRefMediaCount < refMedia.length) {
+      removedRefMediaCount++;
+      candidate = buildCandidate();
+      if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
+    }
+
+    // 标志位只在真正缩短文本时置位：未进入循环说明正文本来就是完整的
+    if (refText) {
+      while (refTextLimit > 140) {
+        refTextLimit = Math.max(140, refTextLimit - 100);
+        refTextTrimmed = true;
         candidate = buildCandidate();
         if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
       }
+    }
+
+    if (originalText) {
+      while (textLimit > 280) {
+        textLimit = Math.max(280, textLimit - 200);
+        textTrimmed = true;
+        candidate = buildCandidate();
+        if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
+      }
+    }
+
+    if (reference) {
+      referenceDropped = true;
+      candidate = buildCandidate();
+      if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
     }
 
     const minimalNote = message.url
@@ -806,6 +1116,7 @@
       ...message,
       media: [],
       extraLinks: [],
+      referencedTweet: null,
       text: minimalNote,
     };
     return getSingleMessageUriLength(candidate) <= URI_SOFT_MAX ? candidate : null;
@@ -850,12 +1161,19 @@
   }
 
   async function exportToObsidian(btn, deleteBtn, scraper = null) {
+    try {
+      await performExport(btn, deleteBtn, scraper);
+    } catch (err) {
+      // 兜底：抓取/展开/格式化阶段的未预期异常不能把按钮永久停在“抓取中”且禁用
+      console.warn('[export] 导出失败:', err);
+      if (deleteBtn && document.contains(deleteBtn)) syncDeleteGuard(deleteBtn);
+      setButtonStatus(btn, '⚠️ 导出失败', { resetTo: getExportButtonIdleLabel() });
+    }
+  }
+
+  async function performExport(btn, deleteBtn, scraper = null) {
     if (!scraper) {
-      const ul = document.querySelector(`${SEL.messageList} ul`);
-      if (!ul) {
-        setButtonStatus(btn, '⚠️ 未找到对话', { resetTo: getExportButtonIdleLabel() });
-        return;
-      }
+      // 容器是否存在由 scrapeLoadedMessages 判断：找不到或无消息都走「⚪ 无新消息」
       scraper = scrapeLoadedMessages;
     }
 
@@ -872,8 +1190,8 @@
       return;
     }
 
-    // oEmbed：获取完整推文正文并展开正文内 t.co 链接
-    const tweetCount = messages.filter(m => m.url).length;
+    // oEmbed：获取完整推文正文并展开正文内 t.co 链接（fiber 消息已完整，不再请求）
+    const tweetCount = messages.filter(m => m.url && !m.isFromFiber).length;
     if (tweetCount > 0) {
       btn.textContent = `⏳ 抓取推文 (${tweetCount})...`;
       const enriched = await enrichWithOembed(messages);
@@ -884,8 +1202,17 @@
       }
     }
 
+    // 引用/回复补全独立于顶层 oEmbed：fiber 消息顶层不请求，但它的回复目标仍需补全
+    messages = await expandReferencedTweets(messages);
+
+    // 结构化推文 URL 与跨层级重复链接在这里一次性剔除，t.co 展开前完成：
+    // 死链不再触发网络请求，formatMarkdown 仍会再兜底过滤一次
+    messages = messages.map(withoutStructuralStatusLinks);
+
     // 展开卡片 DOM 里剩余的 t.co 短链（链接预览卡等）
-    const tcoCount = messages.reduce((n, m) => n + (m.extraLinks || []).filter(l => l.href.includes('t.co/')).length, 0);
+    const tcoCount = messages.reduce((n, m) => n
+      + (m.extraLinks || []).filter(l => l.href.includes('t.co/')).length
+      + (m.referencedTweet?.extraLinks || []).filter(l => l.href.includes('t.co/')).length, 0);
     if (tcoCount > 0) {
       btn.textContent = `⏳ 展开链接 (${tcoCount})...`;
       messages = await resolveExtraLinks(messages);
@@ -1017,7 +1344,7 @@
     if (!hasExportedCurrentConversation()) {
       clearDeleteConfirmState(deleteBtn);
       setButtonStatus(deleteBtn, '⚠️ 先归档再删', {
-        resetTo: '🗑️ 删除已载入',
+        resetTo: getDeleteButtonIdleLabel(deleteBtn),
         onReset: () => syncDeleteGuard(deleteBtn),
       });
       return;
@@ -1027,7 +1354,7 @@
     if (!initial.length) {
       clearDeleteConfirmState(deleteBtn);
       setButtonStatus(deleteBtn, '⚪ 无可删消息', {
-        resetTo: '🗑️ 删除已载入',
+        resetTo: getDeleteButtonIdleLabel(deleteBtn),
         onReset: () => syncDeleteGuard(deleteBtn),
       });
       return;
@@ -1076,7 +1403,7 @@
       deleteBtn,
       fail === 0 ? `✅ 删除 ${success} 条` : `⚠️ 删成${success} 失败${fail}`,
       {
-        resetTo: '🗑️ 删除已载入',
+        resetTo: getDeleteButtonIdleLabel(deleteBtn),
         resetMs: 4000,
         onReset: () => syncDeleteGuard(deleteBtn),
       }
@@ -1090,6 +1417,8 @@
     const btn = document.createElement('button');
     btn.id = id;
     btn.textContent = label;
+    // 记录空闲文案：确认态取消与状态复位都靠它还原标签（书签页与 DM 页文案不同）
+    btn.dataset.idleLabel = label;
     Object.assign(btn.style, {
       backgroundColor: color,
       color: '#fff',
@@ -1136,8 +1465,35 @@
     const authorUrl = [...article.querySelectorAll('a[href]')].find(a =>
       /^https?:\/\/(x\.com|twitter\.com)\/[^/?#]+\/?$/.test(a.href)
     )?.href || '';
+    const tweetId = statusIdFromUrl(url);
+    // 只有拿到自身 tweetId 才能比较：否则首个 /status/ 链接就是自己，引用会指向自身
+    const relatedUrl = tweetId
+      ? [...article.querySelectorAll('a[href*="/status/"]')]
+        .map(a => a.href)
+        .find(href => {
+          const id = statusIdFromUrl(href);
+          return id && id !== tweetId && !/\/(?:photo|video)\/\d+/.test(href);
+        }) || ''
+      : '';
     if (!url && !text) return null;
-    return { url, authorUrl, author, time, text, media, extraLinks: [] };
+    return {
+      url,
+      authorUrl,
+      author,
+      time,
+      text,
+      media,
+      extraLinks: [],
+      referencedTweet: relatedUrl ? { relation: 'unknown', url: relatedUrl, needsFetch: true } : null,
+    };
+  }
+
+  // 书签条目的导出 key：url:<推文地址>，无地址时退化到正文。
+  // 归档与视觉标记必须用同一份推导，否则 DOM 时间链接（可能带查询参数）
+  // 和 fiber 规范地址算出的 key 永远对不上。
+  function buildBookmarkMessageKey(data) {
+    if (!data) return '';
+    return data.url ? `url:${data.url}` : `text:${data.text}`;
   }
 
   function scrapeBookmarks() {
@@ -1145,7 +1501,7 @@
     for (const article of document.querySelectorAll(SEL.bookmarkArticle)) {
       const data = parseBookmarkArticle(article);
       if (!data) continue;
-      const messageKey = data.url ? `url:${data.url}` : `text:${data.text}`;
+      const messageKey = buildBookmarkMessageKey(data);
       result.push({ liEl: article, articleEl: article, messageKey, ...data });
     }
     return result;
@@ -1155,7 +1511,7 @@
     if (!hasExportedCurrentConversation()) {
       clearDeleteConfirmState(deleteBtn);
       setButtonStatus(deleteBtn, '⚠️ 先归档再取消', {
-        resetTo: '🗑️ 取消收藏',
+        resetTo: getDeleteButtonIdleLabel(deleteBtn),
         onReset: () => syncDeleteGuard(deleteBtn),
       });
       return;
@@ -1165,7 +1521,7 @@
     if (!initial.length) {
       clearDeleteConfirmState(deleteBtn);
       setButtonStatus(deleteBtn, '⚪ 无可取消书签', {
-        resetTo: '🗑️ 取消收藏',
+        resetTo: getDeleteButtonIdleLabel(deleteBtn),
         onReset: () => syncDeleteGuard(deleteBtn),
       });
       return;
@@ -1200,7 +1556,7 @@
       deleteBtn,
       fail === 0 ? `✅ 取消 ${success} 条` : `⚠️ 成功${success} 失败${fail}`,
       {
-        resetTo: '🗑️ 取消收藏',
+        resetTo: getDeleteButtonIdleLabel(deleteBtn),
         resetMs: 4000,
         onReset: () => syncDeleteGuard(deleteBtn),
       }
@@ -1248,10 +1604,10 @@
   function updateExportedVisuals(flash = false) {
     ensureExportedStyle();
     // 书签/历史页
+    // 无已导出记录时跳过逐条 fiber 解析（DOM 观察回调里调用频繁），只需清掉旧标记
+    const anyExported = hasExportedCurrentConversation();
     for (const article of document.querySelectorAll(SEL.bookmarkArticle)) {
-      const timeEl = article.querySelector('time');
-      const url = timeEl?.closest('a')?.href || '';
-      const key = url ? `url:${url}` : '';
+      const key = anyExported ? buildBookmarkMessageKey(parseBookmarkArticle(article)) : '';
       const exported = !!key && isMessageExported(key);
       article.classList.toggle('obsidian-exported', exported);
       if (flash && exported) {
@@ -1261,14 +1617,15 @@
       }
     }
     // DM 页
-    for (const msgEl of document.querySelectorAll('[data-testid^="message-"]')) {
+    for (const msgEl of document.querySelectorAll(SEL.messageItem)) {
       const testid = msgEl.getAttribute('data-testid') || '';
       if (testid.startsWith('message-text-')) continue;
       if (testid.includes('-button-') || testid.includes('-reaction-')) continue;
-      const card = msgEl.querySelector('[style*="grid-area: content"] a[href*="/status/"]');
-      if (!card) continue;
+      // key 先于推文卡片推导：纯文本消息没有卡片，提前 continue 会让已归档消息拿不到标记
       const idPart = testid.startsWith('message-') ? testid.slice('message-'.length) : '';
-      const key = idPart ? `id:${idPart}` : `url:${card.href}`;
+      const card = idPart ? null : msgEl.querySelector('[style*="grid-area: content"] a[href*="/status/"]');
+      const key = idPart ? `id:${idPart}` : (card ? `url:${card.href}` : '');
+      if (!key) continue;
       const exported = isMessageExported(key);
       msgEl.classList.toggle('obsidian-exported', exported);
       if (flash && exported) {
