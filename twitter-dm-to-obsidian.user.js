@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter DM to Obsidian
 // @namespace    https://github.com/comicchang/twitter-dm-to-obsidian
-// @version      3.10.0
+// @version      3.11.0
 // @description  将 Twitter/X DM 消息（转发推文）批量导入 Obsidian，支持删除已载入消息、书签/历史页推文导入与取消收藏
 // @author       comicchang
 // @homepageURL  https://github.com/comicchang/twitter-dm-to-obsidian
@@ -94,12 +94,13 @@
       }
     }
 
-    // 正文候选：译文（Grok 翻译）→ 长推文 → 扩展推文 → 原文
-    const rawText = v.grok_translated_post?.translation
-      || v.note_tweet?.text
+    // 原文与译文分开保存：译文存在时不能覆盖原文，格式化阶段再按页面展示并列输出
+    const originalText = v.note_tweet?.text
       || v.extended_tweet?.full_text
       || v.full_text
       || '';
+    const translatedText = v.grok_translated_post?.translation || '';
+    const rawText = originalText || translatedText;
     // 既无正文也无媒体的 fiber prop 不是推文
     if (!rawText && !media.length) return null;
 
@@ -112,17 +113,21 @@
     const tweetId = v.id_str || '';
     const authorUrl = `https://x.com/${v.user.screen_name}`;
 
-    // 译文（Grok 翻译）
-    const translatedText = v.grok_translated_post?.translation || null;
     const lang = v.lang || '';
 
-    // 展开后的 URL（优先用译文实体的，其次用长推文实体的，最后用原文实体的）
-    // 空数组同样算“没有实体”：|| 会被 [] 短路，回退不到后面的来源
+    // 合并译文、长推文、原文实体，避免译文实体存在时漏掉原文独有链接
+    const seenEntityUrls = new Set();
     const urlEntities = [
       v.grok_translated_post?.entities?.urls,
       v.note_tweet?.entity_set?.urls,
+      v.extended_tweet?.entities?.urls,
       v.entities?.urls,
-    ].find(list => Array.isArray(list) && list.length) || [];
+    ].flat().filter(u => {
+      const key = u?.expanded_url || u?.url;
+      if (!key || seenEntityUrls.has(key)) return false;
+      seenEntityUrls.add(key);
+      return true;
+    });
     const expandedUrls = urlEntities.map(u => u.expanded_url).filter(Boolean);
 
     // 额外链接：entities 中的展开 URL，排除推文自身和作者链接
@@ -147,10 +152,16 @@
       : '';
 
     // 清理正文中的 t.co/pic.twitter.com 引用（展开 URL 已在 extraLinks 中）
-    const displayText = rawText
+    const cleanText = value => (value || '')
       .replace(/\s*(?:https?:\/\/)?t\.co\/\S+/g, '')
       .replace(/\s*(?:https?:\/\/)?pic\.twitter\.com\/\S+/g, '')
       .trim();
+    const cleanedOriginalText = cleanText(originalText);
+    const cleanedTranslatedText = cleanText(translatedText);
+    const displayText = cleanedOriginalText || cleanedTranslatedText;
+    const normalizedTranslation = cleanedTranslatedText && cleanedTranslatedText !== displayText
+      ? cleanedTranslatedText
+      : '';
 
     return {
       url: tweetUrl,
@@ -160,8 +171,8 @@
       text: displayText,
       media,
       extraLinks,
-      translatedText,
-      lang,
+      translatedText: normalizedTranslation,
+      lang: normalizedTranslation ? lang : '',
       isFromFiber: true,
       referencedTweet: includeReference ? extractReferencedTweetFromStatus(v) : null,
     };
@@ -202,7 +213,7 @@
    * @param {Element} el - article[data-testid="tweet"] 或含推文数据的 DOM 元素
    * @returns {Object|null} 兼容 parseMessage 返回格式的对象，附带 translatedText/lang/isFromFiber
    */
-  function extractTweetFromFiber(el) {
+  function extractTweetFromFiber(el, includeReference = true) {
     const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
     if (!fiberKey) return null;
 
@@ -213,7 +224,7 @@
       if (!mp) { walk = walk.return; continue; }
 
       for (const key of Object.keys(mp)) {
-        const data = buildTweetDataFromStatus(mp[key], true);
+        const data = buildTweetDataFromStatus(mp[key], includeReference);
         if (data) candidates.push(data);
       }
       walk = walk.return;
@@ -470,7 +481,7 @@
     const BATCH = 3;
     const result = messages.map(m => ({ ...m, extraLinks: [...(m.extraLinks || [])] }));
     // fiber 消息不请求 oEmbed：正文/媒体/展开 URL 在 fiber 里已是权威数据
-    const tweetItems = result.filter(m => m.url && !m.isFromFiber);
+    const tweetItems = result.filter(m => m.url && !m.isFromFiber && !m.fromCache);
     const skippedMessageKeys = [];
 
     for (let i = 0; i < tweetItems.length; i += BATCH) {
@@ -485,7 +496,16 @@
 
         const { p, tcoLinks } = data;
         const cleaned = cleanOembedText(p);
-        if (cleaned) msg.text = cleaned;
+        if (cleaned) {
+          const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+          const sourceParts = msg.sourceTextParts || [];
+          const matchedPart = sourceParts.findIndex(part => normalize(part) === normalize(cleaned));
+          if (sourceParts.length > 1 && matchedPart >= 0) {
+            const otherText = sourceParts.filter((_, index) => index !== matchedPart).join('\n').trim();
+            if (otherText && normalize(otherText) !== normalize(cleaned)) msg.translatedText = otherText;
+          }
+          msg.text = cleaned;
+        }
         for (const href of tcoLinks) {
           msg.extraLinks.push({ href, label: '' });
         }
@@ -512,7 +532,7 @@
    */
   async function expandReferencedTweets(messages) {
     // 只补全只有 URL 的引用（回复目标 / DOM 回退）；fiber 引用已完整，不再重复请求
-    const pending = messages.filter(m => m.referencedTweet?.url && m.referencedTweet.needsFetch);
+    const pending = messages.filter(m => !m.fromCache && m.referencedTweet?.url && m.referencedTweet.needsFetch);
     const BATCH = 3;
 
     for (let i = 0; i < pending.length; i += BATCH) {
@@ -541,6 +561,10 @@
    * 返回 {url, text} 或 null（无法提取则跳过）
    */
   function parseMessage(msgEl) {
+    // fiber 优先：DM 卡片同样挂在 React 树上，可拿到完整原文、自动翻译、语言和展开 URL
+    const fiberData = extractTweetFromFiber(msgEl, false);
+    if (fiberData) return fiberData;
+
     // 内容区域（grid-area: content）下的所有 <a>
     // 注意：<a> 嵌套 <a> 是非法 HTML，浏览器解析后链接预览卡会变成兄弟节点
     const contentArea = msgEl.querySelector('[style*="grid-area: content"]');
@@ -558,12 +582,13 @@
       // 相对时间戳（如 "22h"）
       const time = card.querySelector(SEL.tweetTime)?.textContent?.trim() || '';
 
-      // 推文正文：取 card 内 span[dir="auto"] > span 的第一段纯文字
-      let text = '';
+      // 推文正文：保留 card 内所有非空文本段，避免多段正文或页面翻译文本被截成第一段
+      const textParts = [];
       for (const el of card.querySelectorAll(SEL.tweetText)) {
         const t = el.textContent.trim();
-        if (t) { text = t; break; }
+        if (t && !textParts.includes(t)) textParts.push(t);
       }
+      const text = textParts.join('\n');
 
       // 媒体：视频（video.twimg.com URL 长期有效）和推文内容图片（跳过头像）
       const media = [];
@@ -597,7 +622,7 @@
         extraLinks.push({ href, label: sourceLabel || '' });
       }
 
-      return { url: card.href, authorUrl, author, time, text, media, extraLinks };
+      return { url: card.href, authorUrl, author, time, text, media, extraLinks, sourceTextParts: textParts };
     }
 
     // fallback：纯文字消息（无推文卡片）
@@ -749,6 +774,8 @@
       authorUrl = '',
       time = '',
       text = '',
+      translatedText = '',
+      lang = '',
       media = [],
       extraLinks = [],
       referencedTweet = null,
@@ -767,6 +794,11 @@
 
     // 正文：多行文本按 nested list 处理；空行保持为空，连续空行归一
     if (text) lines.push(formatTextLines(text, `${indent}\t`));
+    // 页面存在自动翻译时原文与译文并列输出，译文不再覆盖原文
+    if (translatedText && translatedText.trim() !== text.trim()) {
+      const translationLabel = `🌐 译文${lang ? ` (${lang})` : ''}`;
+      lines.push(formatTextLines(`${translationLabel}\n${translatedText}`, `${indent}\t`));
+    }
 
     // 引用/回复推文只在顶层展开一层；被展开推文自身的 referencedTweet 被忽略
     if (allowReference && referencedTweet?.url) {
@@ -808,8 +840,15 @@
 
     for (const rawMessage of messages) {
       const message = withoutStructuralStatusLinks(rawMessage);
-      if (message.url) lines.push(...formatTweetMarkdown(message));
-      else lines.push(`- ${message.text}`);
+      if (message.url) {
+        lines.push(...formatTweetMarkdown(message));
+      } else {
+        lines.push(`- ${message.text}`);
+        if (message.translatedText && message.translatedText.trim() !== message.text.trim()) {
+          const translationLabel = `🌐 译文${message.lang ? ` (${message.lang})` : ''}`;
+          lines.push(formatTextLines(`${translationLabel}\n${message.translatedText}`, '\t'));
+        }
+      }
       lines.push('');
     }
 
@@ -824,9 +863,13 @@
   const URI_SOFT_MAX = 7000;
   const BUTTON_STATUS_RESET_MS = 3500;
   const DELETE_CONFIRM_ARM_MS = 4000;
+  const RECOVERY_CONFIRM_ARM_MS = 4000;
+  const EXPORT_CACHE_MAX_MESSAGES = 200;
   // 安全门禁：每个会话记录“允许删除的消息 key”（已归档或已确认失效）
   const exportedMessageKeysByConversation = new Map();
   const EXPORT_STATE_STORAGE_PREFIX = 'twitter-dm-to-obsidian:exported:';
+  const EXPORT_CACHE_STORAGE_PREFIX = 'twitter-dm-to-obsidian:cache:';
+  const LAST_EXPORT_STORAGE_PREFIX = 'twitter-dm-to-obsidian:last-export:';
 
   // 当前会话 key：/messages/{id}、/i/chat/{id}、/i/bookmarks、/i/history
   // 书签与历史页必须使用不同 key：/i/history 是书签页新 URL，与 /i/bookmarks
@@ -905,6 +948,134 @@
     if (set.size > 0) exportedMessageKeysByConversation.set(conversationKey, set);
     else exportedMessageKeysByConversation.delete(conversationKey);
     savePersistedMessageSet(conversationKey, set);
+  }
+
+  function serializeMessageForCache(message) {
+    if (!message?.messageKey) return null;
+    return {
+      messageKey: message.messageKey,
+      url: message.url || '',
+      authorUrl: message.authorUrl || '',
+      author: message.author || '',
+      time: message.time || '',
+      text: message.text || '',
+      translatedText: message.translatedText || '',
+      lang: message.lang || '',
+      media: Array.isArray(message.media) ? message.media : [],
+      extraLinks: Array.isArray(message.extraLinks) ? message.extraLinks : [],
+      referencedTweet: message.referencedTweet || null,
+      isFromFiber: !!message.isFromFiber,
+    };
+  }
+
+  function getExportCacheStorageKey(conversationKey) {
+    return `${EXPORT_CACHE_STORAGE_PREFIX}${conversationKey}`;
+  }
+
+  function loadExportCache(conversationKey) {
+    if (!conversationKey) return [];
+    try {
+      const raw = localStorage.getItem(getExportCacheStorageKey(conversationKey));
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed)
+        ? parsed.filter(item => item && typeof item.messageKey === 'string' && item.messageKey)
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveExportCache(conversationKey, messages) {
+    if (!conversationKey) return;
+    const byKey = new Map();
+    for (const item of loadExportCache(conversationKey)) byKey.set(item.messageKey, item);
+    for (const message of messages) {
+      const serialized = serializeMessageForCache(message);
+      if (!serialized) continue;
+      byKey.delete(serialized.messageKey);
+      byKey.set(serialized.messageKey, serialized);
+    }
+    const merged = [...byKey.values()].slice(-EXPORT_CACHE_MAX_MESSAGES);
+    try {
+      if (!merged.length) localStorage.removeItem(getExportCacheStorageKey(conversationKey));
+      else localStorage.setItem(getExportCacheStorageKey(conversationKey), JSON.stringify(merged));
+    } catch {}
+  }
+
+  function removeCachedMessages(messageKeys) {
+    const conversationKey = getCurrentConversationKey();
+    if (!conversationKey || !messageKeys?.length) return;
+    const removed = new Set(messageKeys);
+    const kept = loadExportCache(conversationKey).filter(item => !removed.has(item.messageKey));
+    try {
+      if (!kept.length) localStorage.removeItem(getExportCacheStorageKey(conversationKey));
+      else localStorage.setItem(getExportCacheStorageKey(conversationKey), JSON.stringify(kept));
+    } catch {}
+  }
+
+  function mergeCachedMessages(freshMessages) {
+    const conversationKey = getCurrentConversationKey();
+    if (!conversationKey) return freshMessages;
+    const freshKeys = new Set(freshMessages.map(message => message.messageKey));
+    const cached = loadExportCache(conversationKey)
+      .filter(item => !freshKeys.has(item.messageKey) && !isMessageExported(item.messageKey))
+      .map(item => ({ ...item, fromCache: true }));
+    return [...freshMessages, ...cached];
+  }
+
+  function getLastExportStorageKey(conversationKey) {
+    return `${LAST_EXPORT_STORAGE_PREFIX}${conversationKey}`;
+  }
+
+  function loadLastExportRecord(conversationKey) {
+    if (!conversationKey) return null;
+    try {
+      const raw = localStorage.getItem(getLastExportStorageKey(conversationKey));
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed.uri !== 'string' || !parsed.uri.startsWith('obsidian://')) return null;
+      return {
+        uri: parsed.uri,
+        messageKeys: Array.isArray(parsed.messageKeys)
+          ? parsed.messageKeys.filter(v => typeof v === 'string' && v)
+          : [],
+        at: Number.isFinite(parsed.at) ? parsed.at : 0,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function saveLastExportRecord(messageKeys, uri) {
+    const conversationKey = getCurrentConversationKey();
+    if (!conversationKey) return;
+    try {
+      localStorage.setItem(getLastExportStorageKey(conversationKey), JSON.stringify({
+        uri,
+        messageKeys: messageKeys.filter(v => typeof v === 'string' && v),
+        at: Date.now(),
+      }));
+    } catch {}
+  }
+
+  function clearLastExportRecord(messageKeys = []) {
+    const conversationKey = getCurrentConversationKey();
+    if (!conversationKey) return;
+    const record = loadLastExportRecord(conversationKey);
+    if (!record) return;
+    const removed = new Set(messageKeys);
+    if (!messageKeys.length || record.messageKeys.some(key => removed.has(key))) {
+      try { localStorage.removeItem(getLastExportStorageKey(conversationKey)); } catch {}
+    }
+  }
+
+  function clearCurrentConversationExportedState() {
+    const conversationKey = getCurrentConversationKey();
+    if (!conversationKey) return false;
+    exportedMessageKeysByConversation.delete(conversationKey);
+    savePersistedMessageSet(conversationKey, new Set());
+    return true;
   }
 
   // 根据安全门禁刷新删除按钮状态
@@ -1015,19 +1186,23 @@
     const originalMedia = [...(message.media || [])];
     const originalLinks = [...(message.extraLinks || [])];
     const originalText = message.text || '';
+    const originalTranslatedText = message.translatedText || '';
     const reference = message.referencedTweet || null;
     const refMedia = [...(reference?.media || [])];
     const refLinks = [...(reference?.extraLinks || [])];
     const refText = reference?.text || '';
+    const refTranslatedText = reference?.translatedText || '';
 
     let removedMediaCount = 0;
     let removedLinkCount = 0;
     let textTrimmed = false;
     let textLimit = originalText.length;
+    let translatedTextLimit = originalTranslatedText.length;
     let removedRefMediaCount = 0;
     let removedRefLinkCount = 0;
     let refTextTrimmed = false;
     let refTextLimit = refText.length;
+    let refTranslatedTextLimit = refTranslatedText.length;
     let referenceDropped = false;
 
     function buildCandidate() {
@@ -1040,6 +1215,9 @@
       const media = originalMedia.slice(0, originalMedia.length - removedMediaCount);
       const extraLinks = originalLinks.slice(0, originalLinks.length - removedLinkCount);
       const text = buildTruncatedText(originalText, textLimit, note);
+      const translatedText = originalTranslatedText
+        ? buildTruncatedText(originalTranslatedText, translatedTextLimit, '')
+        : '';
       // 引用降到最小时只剩 header + 链接；再不行就整块丢弃
       const referencedTweet = (!reference || referenceDropped)
         ? null
@@ -1052,9 +1230,12 @@
             removedMediaCount: removedRefMediaCount,
             removedLinkCount: removedRefLinkCount,
           })),
+          translatedText: refTranslatedText
+            ? buildTruncatedText(refTranslatedText, refTranslatedTextLimit, '')
+            : '',
           needsFetch: false,
         };
-      return { ...message, media, extraLinks, text, referencedTweet };
+      return { ...message, media, extraLinks, text, translatedText, referencedTweet };
     }
 
     let candidate = buildCandidate();
@@ -1085,18 +1266,26 @@
     }
 
     // 标志位只在真正缩短文本时置位：未进入循环说明正文本来就是完整的
-    if (refText) {
-      while (refTextLimit > 140) {
-        refTextLimit = Math.max(140, refTextLimit - 100);
+    if (refText || refTranslatedText) {
+      while (refTextLimit > 140 || refTranslatedTextLimit > 140) {
+        const nextRefTextLimit = Math.max(140, refTextLimit - 100);
+        const nextRefTranslatedLimit = Math.max(140, refTranslatedTextLimit - 100);
+        if (nextRefTextLimit === refTextLimit && nextRefTranslatedLimit === refTranslatedTextLimit) break;
+        refTextLimit = nextRefTextLimit;
+        refTranslatedTextLimit = nextRefTranslatedLimit;
         refTextTrimmed = true;
         candidate = buildCandidate();
         if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
       }
     }
 
-    if (originalText) {
-      while (textLimit > 280) {
-        textLimit = Math.max(280, textLimit - 200);
+    if (originalText || originalTranslatedText) {
+      while (textLimit > 280 || translatedTextLimit > 280) {
+        const nextTextLimit = Math.max(280, textLimit - 200);
+        const nextTranslatedLimit = Math.max(280, translatedTextLimit - 200);
+        if (nextTextLimit === textLimit && nextTranslatedLimit === translatedTextLimit) break;
+        textLimit = nextTextLimit;
+        translatedTextLimit = nextTranslatedLimit;
         textTrimmed = true;
         candidate = buildCandidate();
         if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
@@ -1118,6 +1307,7 @@
       extraLinks: [],
       referencedTweet: null,
       text: minimalNote,
+      translatedText: '',
     };
     return getSingleMessageUriLength(candidate) <= URI_SOFT_MAX ? candidate : null;
   }
@@ -1181,7 +1371,9 @@
     btn.disabled = true;
 
     // 书签页用 DOM 原始顺序（最新在前），DM 页按屏幕位置降序（底部最新在前）
-    let messages = (scraper === scrapeLoadedMessages ? sortMessagesForExport(scraper()) : scraper())
+    const freshMessages = (scraper === scrapeLoadedMessages ? sortMessagesForExport(scraper()) : scraper())
+      .filter(m => !isMessageExported(m.messageKey));
+    let messages = mergeCachedMessages(freshMessages)
       .filter(m => !isMessageExported(m.messageKey));
     const skippedDeletedTweetKeys = [];
     if (!messages.length) {
@@ -1218,6 +1410,9 @@
       messages = await resolveExtraLinks(messages);
     }
 
+    // 已完成 oEmbed / t.co / 引用展开的纯数据结果落缓存，下次点击无需重复抓取
+    saveExportCache(getCurrentConversationKey(), messages);
+
     const { selected, remaining, blockedBySingleOversize, truncatedCount } = takeExportableMessagePrefix(messages);
     if (!selected.length) {
       if (deleteBtn && document.contains(deleteBtn)) syncDeleteGuard(deleteBtn);
@@ -1242,6 +1437,7 @@
     }
 
     btn.textContent = `⏳ 导出 ${selected.length} 条...`;
+    saveLastExportRecord(selected.map(m => m.messageKey), uri);
     // 先落库再导航：window.location.href 赋值后页面可能立即卸载/被系统提示打断，
     // 必须保证已导出状态在导航发起前写入 localStorage，删除安全门禁才可靠
     markMessagesExported(selected.map(m => m.messageKey));
@@ -1391,6 +1587,8 @@
       if (ok) {
         success++;
         unmarkMessageExported(key);
+        removeCachedMessages([key]);
+        clearLastExportRecord([key]);
       } else {
         fail++;
       }
@@ -1436,6 +1634,209 @@
     btn.addEventListener('mouseover', () => { if (!btn.disabled) btn.style.backgroundColor = hoverColor; });
     btn.addEventListener('mouseout',  () => { if (!btn.disabled) btn.style.backgroundColor = color; });
     return btn;
+  }
+
+  function makeSmallBtn(id, label, color, hoverColor) {
+    const btn = makeBtn(id, label, color, hoverColor);
+    Object.assign(btn.style, {
+      padding: '0 8px',
+      minWidth: '28px',
+      height: '28px',
+      fontSize: '12px',
+    });
+    return btn;
+  }
+
+  let recoveryOutsideListenerAttached = false;
+
+  function getRecoveryButtonIdleLabel() {
+    return '🔧';
+  }
+
+  function resetRecoveryMenuItem(item) {
+    if (!item) return;
+    clearTimeout(item._confirmTimer);
+    item.dataset.confirm = '';
+    item.textContent = item.dataset.idleLabel || '';
+  }
+
+  function armRecoveryMenuItem(item, confirmLabel) {
+    if (!item) return;
+    resetRecoveryMenuItem(item);
+    item.dataset.confirm = '1';
+    item.textContent = confirmLabel;
+    item._confirmTimer = setTimeout(() => resetRecoveryMenuItem(item), RECOVERY_CONFIRM_ARM_MS);
+  }
+
+  function closeRecoveryMenu() {
+    const menu = document.getElementById('obsidian-recovery-menu');
+    if (!menu) return;
+    menu.hidden = true;
+    menu.style.display = 'none';
+  }
+
+  function ensureRecoveryUi() {
+    let menu = document.getElementById('obsidian-recovery-menu');
+    if (!menu) {
+      menu = document.createElement('div');
+      menu.id = 'obsidian-recovery-menu';
+      menu.hidden = true;
+      Object.assign(menu.style, {
+        position: 'fixed',
+        zIndex: '2147483647',
+        minWidth: '190px',
+        padding: '6px',
+        background: '#202327',
+        color: '#fff',
+        border: '1px solid #4b5563',
+        borderRadius: '10px',
+        boxShadow: '0 8px 24px rgba(0,0,0,0.25)',
+        display: 'none',
+        flexDirection: 'column',
+        gap: '4px',
+        fontSize: '12px',
+      });
+      for (const [action, label] of [
+        ['resend', '重发上次导出'],
+        ['unmark', '全部标记未抓取'],
+      ]) {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.dataset.action = action;
+        item.dataset.idleLabel = label;
+        item.textContent = label;
+        Object.assign(item.style, {
+          border: 'none',
+          borderRadius: '6px',
+          padding: '7px 9px',
+          background: 'transparent',
+          color: 'inherit',
+          textAlign: 'left',
+          cursor: 'pointer',
+        });
+        item.addEventListener('mouseenter', () => { item.style.background = '#34373d'; });
+        item.addEventListener('mouseleave', () => { item.style.background = 'transparent'; });
+        item.addEventListener('click', event => {
+          event.stopPropagation();
+          handleRecoveryAction(item, action);
+        });
+        menu.appendChild(item);
+      }
+      document.body.appendChild(menu);
+    }
+
+    if (!document.getElementById('obsidian-recovery-tooltip')) {
+      const tooltip = document.createElement('div');
+      tooltip.id = 'obsidian-recovery-tooltip';
+      tooltip.hidden = true;
+      Object.assign(tooltip.style, {
+        position: 'fixed',
+        zIndex: '2147483647',
+        maxWidth: '240px',
+        padding: '7px 9px',
+        background: '#111827',
+        color: '#fff',
+        border: '1px solid #4b5563',
+        borderRadius: '7px',
+        boxShadow: '0 6px 18px rgba(0,0,0,0.22)',
+        fontSize: '12px',
+        lineHeight: '1.4',
+        pointerEvents: 'none',
+      });
+      document.body.appendChild(tooltip);
+    }
+
+    if (!recoveryOutsideListenerAttached) {
+      document.addEventListener('click', event => {
+        const currentMenu = document.getElementById('obsidian-recovery-menu');
+        if (currentMenu && !currentMenu.hidden && !currentMenu.contains(event.target)) {
+          closeRecoveryMenu();
+        }
+      });
+      recoveryOutsideListenerAttached = true;
+    }
+    return menu;
+  }
+
+  function positionRecoveryFloating(el, btn) {
+    const rect = btn.getBoundingClientRect();
+    const width = el.offsetWidth || 190;
+    const height = el.offsetHeight || 80;
+    el.style.top = `${Math.max(8, Math.min(window.innerHeight - height - 8, rect.bottom + 6))}px`;
+    el.style.left = `${Math.max(8, Math.min(window.innerWidth - width - 8, rect.right - width))}px`;
+  }
+
+  function showRecoveryTooltip(btn) {
+    const menu = ensureRecoveryUi();
+    const tooltip = document.getElementById('obsidian-recovery-tooltip');
+    if (!tooltip) return;
+    tooltip.textContent = '低频恢复工具：重发上次导出 / 全部标记未抓取。点击图标后需二次确认，防止误触。';
+    tooltip.hidden = false;
+    positionRecoveryFloating(tooltip, btn);
+    menu._tooltipOwner = btn;
+  }
+
+  function hideRecoveryTooltip() {
+    const tooltip = document.getElementById('obsidian-recovery-tooltip');
+    if (tooltip) tooltip.hidden = true;
+  }
+
+  function toggleRecoveryMenu(btn) {
+    const menu = ensureRecoveryUi();
+    if (!menu.hidden && menu._owner === btn) {
+      closeRecoveryMenu();
+      return;
+    }
+
+    const resendItem = menu.querySelector('[data-action="resend"]');
+    if (resendItem) {
+      resetRecoveryMenuItem(resendItem);
+      resendItem.disabled = !loadLastExportRecord(getCurrentConversationKey());
+      resendItem.title = resendItem.disabled
+        ? '暂无上次导出记录'
+        : '重新派发上次生成的 obsidian://advanced-uri';
+    }
+    const unmarkItem = menu.querySelector('[data-action="unmark"]');
+    if (unmarkItem) resetRecoveryMenuItem(unmarkItem);
+
+    menu._owner = btn;
+    menu.hidden = false;
+    menu.style.display = 'flex';
+    positionRecoveryFloating(menu, btn);
+    hideRecoveryTooltip();
+  }
+
+  function handleRecoveryAction(item, action) {
+    if (!item || item.disabled) return;
+    if (item.dataset.confirm !== '1') {
+      armRecoveryMenuItem(item, action === 'resend' ? '⚠️ 再点重发' : '⚠️ 再点清除');
+      return;
+    }
+
+    resetRecoveryMenuItem(item);
+    closeRecoveryMenu();
+    const recoveryBtn = document.getElementById('obsidian-recovery-btn');
+
+    if (action === 'resend') {
+      const record = loadLastExportRecord(getCurrentConversationKey());
+      if (!record?.uri) {
+        setButtonStatus(recoveryBtn, '⚪ 无上次导出', { resetTo: getRecoveryButtonIdleLabel() });
+        return;
+      }
+      window.location.href = record.uri;
+      setButtonStatus(recoveryBtn, '✅', { resetTo: getRecoveryButtonIdleLabel() });
+      return;
+    }
+
+    if (!hasExportedCurrentConversation()) {
+      setButtonStatus(recoveryBtn, '⚪ 无已抓取状态', { resetTo: getRecoveryButtonIdleLabel() });
+      return;
+    }
+    clearCurrentConversationExportedState();
+    updateExportedVisuals();
+    const deleteBtn = document.getElementById('obsidian-delete-btn');
+    if (deleteBtn) syncDeleteGuard(deleteBtn);
+    setButtonStatus(recoveryBtn, '✅', { resetTo: getRecoveryButtonIdleLabel() });
   }
 
 
@@ -1546,6 +1947,8 @@
         await sleep(300);
         success++;
         unmarkMessageExported(messageKey);
+        removeCachedMessages([messageKey]);
+        clearLastExportRecord([messageKey]);
       } else {
         fail++;
       }
@@ -1644,7 +2047,8 @@
 
     const existingExportBtn = document.getElementById('obsidian-export-btn');
     const existingDeleteBtn = document.getElementById('obsidian-delete-btn');
-    if (existingExportBtn && existingDeleteBtn) {
+    const existingRecoveryBtn = document.getElementById('obsidian-recovery-btn');
+    if (existingExportBtn && existingDeleteBtn && existingRecoveryBtn) {
       if (isDM && existingDeleteBtn.dataset.confirmDelete === '1' && !hasExportedCurrentConversation()) {
         clearDeleteConfirmState(existingDeleteBtn);
       }
@@ -1654,6 +2058,8 @@
     }
     existingExportBtn?.remove();
     existingDeleteBtn?.remove();
+    existingRecoveryBtn?.remove();
+    closeRecoveryMenu();
 
     if (isBookmarks) {
       // 找 header 区域的 h2 标题作为注入锚点（/i/history 页面标题是"历史"，/i/bookmarks 是"书签"）
@@ -1685,9 +2091,20 @@
       exportBtn.addEventListener('click', () => exportToObsidian(exportBtn, deleteBtn, scrapeBookmarks));
       deleteBtn.addEventListener('click', () => unbookmarkAll(deleteBtn));
 
-      // appendChild 让按钮出现在 h2 右侧
+      const recoveryBtn = makeSmallBtn('obsidian-recovery-btn', getRecoveryButtonIdleLabel(), '#3f3f46', '#52525b');
+      recoveryBtn.title = '低频恢复工具：重发上次导出 / 全部标记未抓取';
+      recoveryBtn.setAttribute('aria-label', '恢复工具');
+      recoveryBtn.addEventListener('click', event => {
+        event.stopPropagation();
+        toggleRecoveryMenu(recoveryBtn);
+      });
+      recoveryBtn.addEventListener('mouseenter', () => showRecoveryTooltip(recoveryBtn));
+      recoveryBtn.addEventListener('mouseleave', hideRecoveryTooltip);
+
+      // appendChild 让主按钮出现在 h2 右侧，恢复入口固定放到最右，降低误触概率
       container.appendChild(exportBtn);
       container.appendChild(deleteBtn);
+      container.appendChild(recoveryBtn);
       updateExportedVisuals();
       return;
     }
@@ -1714,9 +2131,20 @@
     exportBtn.title = CONFIG.debug ? '调试模式：写入 debug.md' : '将已载入消息保存到 Obsidian Daily Note';
     exportBtn.addEventListener('click', () => exportToObsidian(exportBtn, deleteBtn));
 
-    // 插入顺序：[📥 Obsidian] [🗑️ 删除已载入] [...]
+    const recoveryBtn = makeSmallBtn('obsidian-recovery-btn', getRecoveryButtonIdleLabel(), '#3f3f46', '#52525b');
+    recoveryBtn.title = '低频恢复工具：重发上次导出 / 全部标记未抓取';
+    recoveryBtn.setAttribute('aria-label', '恢复工具');
+    recoveryBtn.addEventListener('click', event => {
+      event.stopPropagation();
+      toggleRecoveryMenu(recoveryBtn);
+    });
+    recoveryBtn.addEventListener('mouseenter', () => showRecoveryTooltip(recoveryBtn));
+    recoveryBtn.addEventListener('mouseleave', hideRecoveryTooltip);
+
+    // 插入顺序：[📥 Obsidian] [🗑️ 删除已载入] [...] [🔧]
     container.insertBefore(deleteBtn, moreBtn);
     container.insertBefore(exportBtn, deleteBtn);
+    container.appendChild(recoveryBtn);
     updateExportedVisuals();
   }
 

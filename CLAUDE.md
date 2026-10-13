@@ -14,7 +14,7 @@ fix-truncated-tweets.md           ← 修复 Obsidian/Logseq 日记中截断/错
 
 ## 架构概览
 
-脚本在 Twitter/X 的 DM 会话页与书签/历史页（SPA）注入两个按钮，无服务端，所有逻辑在浏览器内运行。
+脚本在 Twitter/X 的 DM 会话页与书签/历史页（SPA）注入两个主按钮和一个低频恢复小图标，无服务端，所有逻辑在浏览器内运行。
 
 ```
 页面加载/路由切换
@@ -23,15 +23,19 @@ fix-truncated-tweets.md           ← 修复 Obsidian/Logseq 日记中截断/错
        │    ├─ scrapeLoadedMessages() / scrapeBookmarks()
        │    │    ├─ parseMessage()          DM：纯 DOM 抓取 url/author/time/text/media/extraLinks（无 referencedTweet）
        │    │    └─ parseBookmarkArticle()  书签/历史页：fiber 优先，回退 DOM；额外填充 referencedTweet
+       │    ├─ 抓取缓存合并（3.11.0）  DOM 当前消息与 localStorage 缓存中未导出消息合并，按 messageKey 去重，DOM 优先
        │    ├─ enrichWithOembed()   oEmbed 补全正文（fetchOembedData，批量并发 3，跳过失效推文）
        │    ├─ expandReferencedTweets()  展开一层引用/回复推文（仅书签/历史页；quoted_status 直接取，回复目标 oEmbed 补全且无媒体）
        │    ├─ resolveExtraLinks()  t.co 短链展开（GM_xmlhttpRequest，5 并发；含一层 referencedTweet.extraLinks）
-       │    ├─ formatMarkdown()     Logseq outliner 格式化（引用/回复推文作为嵌套块）
-       │    └─ obsidian://advanced-uri  追加到 Daily Note
+       │    ├─ formatMarkdown()     Logseq outliner 格式化（引用/回复推文作为嵌套块；原文+译文块并存）
+       │    └─ obsidian://advanced-uri  追加到 Daily Note（超过 URI 上限被截断的消息留在缓存，下轮继续）
        ├─ deleteAllMessages()     🗑️ DM 删除流程
-       │    └─ deleteSingleMessage()  overflow 按钮 → Popover 删除项 → dialog 确认
-       └─ unbookmarkAll()         🗑️ 书签/历史页取消收藏
-            └─ 点击 [data-testid="removeBookmark"]
+       │    └─ deleteSingleMessage()  overflow 按钮 → Popover 删除项 → dialog 确认（成功后从抓取缓存移除该消息）
+       ├─ unbookmarkAll()         🗑️ 书签/历史页取消收藏（成功后从抓取缓存移除该条）
+       │    └─ 点击 [data-testid="removeBookmark"]
+       └─ 恢复菜单（3.11.0）      按钮区最右侧低频小图标入口：悬浮 Tooltip；菜单含「重发上次导出」
+                                   （重新派发上次实际生成的 advanced-uri，不重新抓取）与「全部标记未抓取」
+                                   （清除当前会话已导出状态），均需二次确认
 ```
 
 ## 实际 Twitter DOM 结构（2026-03 验证）
@@ -100,6 +104,7 @@ obsidian://advanced-uri?daily=true&mode=append&data={encodeURIComponent(encodeUR
 - `data` / `vault` / `dailyNotePath` 统一做双层 `encodeURIComponent`，兼容宿主链路可能发生的一次预解码
 - URI 长度上限保守控制为 `URI_SOFT_MAX = 7000`、`URI_MAX = 7400`，避免 custom URI 被链路截断后触发 `URI malformed`
 - 导出超限时只发送“从前往后”装得下的消息前缀，并只把这部分消息标记为可删除
+- **单次导出约 5 条的根因是这个 URI 长度上限，不是虚拟列表 lazy load 硬上限**；被截断的剩余消息暂存在抓取缓存中，下一轮导出直接从缓存继续，无需重新滚动加载
 
 ## t.co 展开
 
@@ -116,6 +121,7 @@ DM 卡片只渲染推文预览，正文内的链接（t.co）可能不出现在�
 3. `expandReferencedTweets(messages)` 补全顶层消息的 `referencedTweet`：**只有 `parseBookmarkArticle()` 产出该字段**，DM 的 `parseMessage()` 不产出。fiber 的 `quoted_status` 直接展开（含媒体）；回复目标通过 oEmbed 获取正文和链接，**oEmbed 不返回媒体，故这类引用/回复块无图片/视频**。补全结果不携带 `referencedTweet`，所以不会递归展开
 4. 失效推文（notFound）跳过归档，但标记为已导出，允许加入待删除集合
 5. 媒体冗余清理：已有图片/视频时移除对应的 `/photo/N`、`/video/N` 链接
+6. **原文+译文保真**：fiber 提取的 `grok_translated_post` 译文（`translatedText`）与 lang 单独存字段，**不得覆盖原文**；formatMarkdown 输出原文块 + 译文块（译文附语言提示）。oEmbed 不返回翻译，DOM 回退路径缺失译文时不得假装补全。超长退化（`fitSingleMessageWithinLimit`）时原文与译文同进退，最终至少保留链接和可识别的关系
 
 ## 删除机制
 
@@ -130,6 +136,28 @@ DM 卡片只渲染推文预览，正文内的链接（t.co）可能不出现在�
 书签/历史页的取消收藏不经过上述链路：直接点击每条 `article` 内的 `[data-testid="removeBookmark"]`。
 
 如需提高成功率，可考虑改用 Twitter 内部 API（需 bearer token 和 CSRF token）。
+
+## 抓取缓存（localStorage，3.11.0）
+
+抓取并完成 oEmbed / t.co 展开 / 引用展开后的推文信息按会话暂存，供下次导出复用：
+
+- **按 conversationKey 隔离**：复用现有导出状态存储约定（`twitter-dm-to-obsidian:exported:<conversationKey>` 一族），缓存键同样以会话为单位（`/messages/{id}`、`/i/chat/{id}`、`/i/bookmarks`、`/i/history` 各自独立）
+- **合并去重**：下次导出合并 DOM 当前消息与缓存中未导出消息，按 messageKey 去重（`id:{UUID}` / `url:{...}` / `text:{...}`，与导出状态同一套 key），**DOM 新鲜数据优先**覆盖缓存
+- **可序列化**：正文（原文/译文）、lang、媒体、extraLinks、referencedTweet 均为纯数据字段；**DOM 引用（liEl / msgEl / articleEl）不得写入缓存**
+- **缓存失效**：成功删除（`deleteSingleMessage`）或取消收藏后从缓存移除对应消息，避免已删除内容复活
+- **引用展开约束不变**：缓存中的 referencedTweet 仍只展开一层，formatMarkdown 按 Logseq outliner 格式还原，译文块带 lang 提示
+
+恢复方式：恢复菜单的「全部标记未抓取」清除当前会话已导出状态（localStorage 中 `twitter-dm-to-obsidian:exported:<conversationKey>`），使内容可重新抓取导出且不被删除门禁误伤。
+
+## 恢复菜单（3.11.0，低频入口）
+
+Obsidian 冷启动可能丢第一条 Advanced URI，而脚本已 `markMessagesExported`——后续删除/取消收藏会把从未写入笔记的内容删掉。恢复入口做成**单一小图标按钮，放在按钮区最右侧**：
+
+- 悬浮显示 Tooltip 说明用途；尺寸小、样式低调，防止与主流程按钮混淆或误触
+- 点击打开小菜单，两个动作均需**二次确认**：
+  1. **重发上次导出**：重新派发上次实际生成的 `obsidian://advanced-uri`（派发前暂存），不重新抓取网络数据
+  2. **全部标记未抓取**：清除当前会话已导出状态，内容可重新抓取；注意再次导出会写入重复内容，仅用于恢复场景
+- 不改变现有导出/删除主流程语义：不做批量自动派发多个 URI 的高风险方案
 
 ## SPA 路由处理
 
@@ -165,3 +193,5 @@ Logseq outliner 格式（无 header/footer）。子级 bullet 用 **Tab** 缩进
 作者行仅在 `author` 与 `authorUrl` 同时存在时才把作者名渲染成 profile 链接（见 `formatTweetMarkdown`）。
 
 时间戳显示 Twitter 原始相对时间，不转换（`22h` / `Mar 1`）。
+
+**原文+译文块**（3.11.0）：fiber 提取到 Twitter 自动翻译（Grok）时，正文先输出原文块，再输出译文块并附语言提示；译文不得覆盖原文。超长精简退化时两者同进退，不会只保留其一。
