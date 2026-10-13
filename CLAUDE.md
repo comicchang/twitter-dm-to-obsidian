@@ -28,13 +28,14 @@ fix-truncated-tweets.md           ← 修复 Obsidian/Logseq 日记中截断/错
        │    ├─ expandReferencedTweets()  展开一层引用/回复推文（仅书签/历史页；quoted_status 直接取，回复目标 oEmbed 补全且无媒体）
        │    ├─ resolveExtraLinks()  t.co 短链展开（GM_xmlhttpRequest，5 并发；含一层 referencedTweet.extraLinks）
        │    ├─ formatMarkdown()     Logseq outliner 格式化（引用/回复推文作为嵌套块；原文+译文块并存）
-       │    └─ obsidian://advanced-uri  追加到 Daily Note（超过 URI 上限被截断的消息留在缓存，下轮继续）
+       │    └─ 导出队列（3.12.0）   超过 URI 上限则拆段，约 3 秒后自动续发；prepend 按旧段到新段派发
+       │         └─ obsidian://advanced-uri  追加到 Daily Note
        ├─ deleteAllMessages()     🗑️ DM 删除流程
        │    └─ deleteSingleMessage()  overflow 按钮 → Popover 删除项 → dialog 确认（成功后从抓取缓存移除该消息）
        ├─ unbookmarkAll()         🗑️ 书签/历史页取消收藏（成功后从抓取缓存移除该条）
        │    └─ 点击 [data-testid="removeBookmark"]
        └─ 恢复菜单（3.11.0）      按钮区最右侧低频小图标入口：悬浮 Tooltip；菜单含「重发上次导出」
-                                   （重新派发上次实际生成的 advanced-uri，不重新抓取）与「全部标记未抓取」
+                                   （重新派发上次完整的多段队列，不重新抓取）与「全部标记未抓取」
                                    （清除当前会话已导出状态），均需二次确认
 ```
 
@@ -103,8 +104,9 @@ obsidian://advanced-uri?daily=true&mode=append&data={encodeURIComponent(encodeUR
 - 必须手动拼接 URI，**不能用** `URLSearchParams`（空格会编为 `+`，Obsidian 不解码）
 - `data` / `vault` / `dailyNotePath` 统一做双层 `encodeURIComponent`，兼容宿主链路可能发生的一次预解码
 - URI 长度上限保守控制为 `URI_SOFT_MAX = 7000`、`URI_MAX = 7400`，避免 custom URI 被链路截断后触发 `URI malformed`
-- 导出超限时只发送“从前往后”装得下的消息前缀，并只把这部分消息标记为可删除
-- **单次导出约 5 条的根因是这个 URI 长度上限，不是虚拟列表 lazy load 硬上限**；被截断的剩余消息暂存在抓取缓存中，下一轮导出直接从缓存继续，无需重新滚动加载
+- 导出超限时按可装入的消息前缀拆段，约 3 秒后自动续发剩余段；队列持久化到 localStorage，页面中断后可继续
+- **单次导出约 5 条的根因是这个 URI 长度上限，不是虚拟列表 lazy load 硬上限**；剩余内容自动续发，已抓取结果暂存在抓取缓存中
+- `prepend` 模式按旧段到新段派发，避免每批插到最前面导致多段导出按 3～4 条一组倒序堆叠
 
 ## t.co 展开
 
@@ -149,15 +151,25 @@ DM 卡片只渲染推文预览，正文内的链接（t.co）可能不出现在�
 
 恢复方式：恢复菜单的「全部标记未抓取」清除当前会话已导出状态（localStorage 中 `twitter-dm-to-obsidian:exported:<conversationKey>`），使内容可重新抓取导出且不被删除门禁误伤。
 
+## 导出队列（3.12.0）
+
+超过单次 URI 上限的导出内容会被拆成多段队列：
+
+- 每段仍受 `URI_SOFT_MAX` / `URI_MAX` 限制，约 3 秒后自动派发下一段
+- 超限时只按**完整消息边界**打包：例如加入第 3 条后超限，就发送前 2 条完整消息，第 3 条及后续消息进入下一段，单条消息不会被切碎；单条消息若本身超过 `URI_MAX`，跳过并提示，不阻塞后续消息
+- 队列和进度写入 localStorage，页面刷新或中断后可继续
+- `prepend` 模式按旧段到新段派发，避免每批 3～4 条插到最前面导致整体倒序
+- 「重发上次导出」会重发完整多段队列，而不是只重发第一段
+
 ## 恢复菜单（3.11.0，低频入口）
 
 Obsidian 冷启动可能丢第一条 Advanced URI，而脚本已 `markMessagesExported`——后续删除/取消收藏会把从未写入笔记的内容删掉。恢复入口做成**单一小图标按钮，放在按钮区最右侧**：
 
 - 悬浮显示 Tooltip 说明用途；尺寸小、样式低调，防止与主流程按钮混淆或误触
 - 点击打开小菜单，两个动作均需**二次确认**：
-  1. **重发上次导出**：重新派发上次实际生成的 `obsidian://advanced-uri`（派发前暂存），不重新抓取网络数据
+  1. **重发上次导出**：重新派发上次导出的完整多段队列，不重新抓取网络数据
   2. **全部标记未抓取**：清除当前会话已导出状态，内容可重新抓取；注意再次导出会写入重复内容，仅用于恢复场景
-- 不改变现有导出/删除主流程语义：不做批量自动派发多个 URI 的高风险方案
+- 自动续发队列与恢复菜单共用持久化 URI 队列；删除/取消收藏或标记未抓取会停止剩余派发
 
 ## SPA 路由处理
 

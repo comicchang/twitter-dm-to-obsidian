@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter DM to Obsidian
 // @namespace    https://github.com/comicchang/twitter-dm-to-obsidian
-// @version      3.11.0
+// @version      3.12.0
 // @description  将 Twitter/X DM 消息（转发推文）批量导入 Obsidian，支持删除已载入消息、书签/历史页推文导入与取消收藏
 // @author       comicchang
 // @homepageURL  https://github.com/comicchang/twitter-dm-to-obsidian
@@ -864,12 +864,14 @@
   const BUTTON_STATUS_RESET_MS = 3500;
   const DELETE_CONFIRM_ARM_MS = 4000;
   const RECOVERY_CONFIRM_ARM_MS = 4000;
+  const EXPORT_CONTINUE_DELAY_MS = 3000;
   const EXPORT_CACHE_MAX_MESSAGES = 200;
   // 安全门禁：每个会话记录“允许删除的消息 key”（已归档或已确认失效）
   const exportedMessageKeysByConversation = new Map();
   const EXPORT_STATE_STORAGE_PREFIX = 'twitter-dm-to-obsidian:exported:';
   const EXPORT_CACHE_STORAGE_PREFIX = 'twitter-dm-to-obsidian:cache:';
   const LAST_EXPORT_STORAGE_PREFIX = 'twitter-dm-to-obsidian:last-export:';
+  const EXPORT_QUEUE_STORAGE_PREFIX = 'twitter-dm-to-obsidian:queue:';
 
   // 当前会话 key：/messages/{id}、/i/chat/{id}、/i/bookmarks、/i/history
   // 书签与历史页必须使用不同 key：/i/history 是书签页新 URL，与 /i/bookmarks
@@ -1034,11 +1036,18 @@
       const raw = localStorage.getItem(getLastExportStorageKey(conversationKey));
       if (!raw) return null;
       const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed.uri !== 'string' || !parsed.uri.startsWith('obsidian://')) return null;
+      const uris = Array.isArray(parsed?.uris)
+        ? parsed.uris.filter(v => typeof v === 'string' && v.startsWith('obsidian://'))
+        : (typeof parsed?.uri === 'string' && parsed.uri.startsWith('obsidian://') ? [parsed.uri] : []);
+      if (!uris.length) return null;
       return {
-        uri: parsed.uri,
+        uri: uris[0],
+        uris,
         messageKeys: Array.isArray(parsed.messageKeys)
           ? parsed.messageKeys.filter(v => typeof v === 'string' && v)
+          : [],
+        messageKeysByUri: Array.isArray(parsed.messageKeysByUri)
+          ? parsed.messageKeysByUri.map(keys => Array.isArray(keys) ? keys.filter(v => typeof v === 'string' && v) : [])
           : [],
         at: Number.isFinite(parsed.at) ? parsed.at : 0,
       };
@@ -1047,13 +1056,16 @@
     }
   }
 
-  function saveLastExportRecord(messageKeys, uri) {
+  function saveLastExportRecord(messageKeys, uris, messageKeysByUri = []) {
     const conversationKey = getCurrentConversationKey();
     if (!conversationKey) return;
+    const uriList = (Array.isArray(uris) ? uris : [uris]).filter(v => typeof v === 'string' && v);
     try {
       localStorage.setItem(getLastExportStorageKey(conversationKey), JSON.stringify({
-        uri,
-        messageKeys: messageKeys.filter(v => typeof v === 'string' && v),
+        uri: uriList[0] || '',
+        uris: uriList,
+        messageKeys: [...new Set(messageKeys.filter(v => typeof v === 'string' && v))],
+        messageKeysByUri: messageKeysByUri.map(keys => Array.isArray(keys) ? keys.filter(v => typeof v === 'string' && v) : []),
         at: Date.now(),
       }));
     } catch {}
@@ -1067,7 +1079,116 @@
     const removed = new Set(messageKeys);
     if (!messageKeys.length || record.messageKeys.some(key => removed.has(key))) {
       try { localStorage.removeItem(getLastExportStorageKey(conversationKey)); } catch {}
+      cancelExportQueue(conversationKey);
     }
+  }
+
+  function getExportQueueStorageKey(conversationKey) {
+    return `${EXPORT_QUEUE_STORAGE_PREFIX}${conversationKey}`;
+  }
+
+  function loadExportQueue(conversationKey) {
+    if (!conversationKey) return null;
+    try {
+      const raw = localStorage.getItem(getExportQueueStorageKey(conversationKey));
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      const uris = Array.isArray(parsed?.uris)
+        ? parsed.uris.filter(v => typeof v === 'string' && v.startsWith('obsidian://'))
+        : [];
+      if (!uris.length) return null;
+      return {
+        uris,
+        messageKeys: Array.isArray(parsed.messageKeys)
+          ? parsed.messageKeys.map(keys => Array.isArray(keys) ? keys.filter(v => typeof v === 'string' && v) : [])
+          : [],
+        nextIndex: Math.max(0, Math.min(Number(parsed.nextIndex) || 0, uris.length)),
+        at: Number.isFinite(parsed.at) ? parsed.at : 0,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function saveExportQueue(conversationKey, queue) {
+    if (!conversationKey || !queue?.uris?.length) return;
+    try {
+      localStorage.setItem(getExportQueueStorageKey(conversationKey), JSON.stringify({
+        uris: queue.uris,
+        messageKeys: queue.messageKeys || [],
+        nextIndex: queue.nextIndex || 0,
+        at: queue.at || Date.now(),
+      }));
+    } catch {}
+  }
+
+  function unmarkQueuedMessageKeys(queue) {
+    const pendingKeys = (queue?.messageKeys || [])
+      .slice(queue?.nextIndex || 0)
+      .flat()
+      .filter(v => typeof v === 'string' && v);
+    for (const key of new Set(pendingKeys)) unmarkMessageExported(key);
+  }
+
+  function cancelExportQueue(conversationKey, { unmarkPending = true } = {}) {
+    const queue = loadExportQueue(conversationKey);
+    if (unmarkPending && queue) unmarkQueuedMessageKeys(queue);
+    clearExportQueue(conversationKey);
+  }
+
+  function clearExportQueue(conversationKey) {
+    if (!conversationKey) return;
+    try { localStorage.removeItem(getExportQueueStorageKey(conversationKey)); } catch {}
+  }
+
+  // prepend 会把每一批插到笔记开头：按内容顺序倒序派发（先旧后新），
+  // 最后派发的段才会位于笔记最上方，最终正文保持脚本内部的消息顺序。
+  function orderChunksForWriteMode(chunks) {
+    return CONFIG.writeMode === 'prepend' ? [...chunks].reverse() : [...chunks];
+  }
+
+  let exportQueueTimer = null;
+
+  function runExportQueue(conversationKey, queue, btn, deleteBtn) {
+    if (!queue?.uris?.length || exportQueueTimer) return;
+    const step = () => {
+      exportQueueTimer = null;
+      const persisted = loadExportQueue(conversationKey);
+      if (!persisted || persisted.nextIndex >= persisted.uris.length) {
+        clearExportQueue(conversationKey);
+        return;
+      }
+      queue = persisted;
+      const uri = queue.uris[queue.nextIndex];
+      if (!uri) {
+        clearExportQueue(conversationKey);
+        return;
+      }
+      queue.nextIndex++;
+      saveExportQueue(conversationKey, queue);
+      window.location.href = uri;
+      if (queue.nextIndex < queue.uris.length) {
+        exportQueueTimer = setTimeout(step, EXPORT_CONTINUE_DELAY_MS);
+      } else {
+        clearExportQueue(conversationKey);
+      }
+      if (btn && document.contains(btn)) {
+        setButtonStatus(btn, `↩️ 续发 ${queue.nextIndex}/${queue.uris.length}`, {
+          resetTo: getExportButtonIdleLabel(),
+          onReset: () => {
+            if (deleteBtn && document.contains(deleteBtn)) syncDeleteGuard(deleteBtn);
+          },
+        });
+      }
+    };
+    step();
+  }
+
+  function resumePendingExportQueue(btn, deleteBtn) {
+    const conversationKey = getCurrentConversationKey();
+    const queue = loadExportQueue(conversationKey);
+    if (!queue || queue.nextIndex >= queue.uris.length) return;
+    runExportQueue(conversationKey, queue, btn, deleteBtn);
   }
 
   function clearCurrentConversationExportedState() {
@@ -1075,6 +1196,7 @@
     if (!conversationKey) return false;
     exportedMessageKeysByConversation.delete(conversationKey);
     savePersistedMessageSet(conversationKey, new Set());
+    cancelExportQueue(conversationKey, { unmarkPending: false });
     return true;
   }
 
@@ -1154,169 +1276,10 @@
     return u;
   }
 
-  function getSingleMessageUriLength(message) {
-    return buildObsidianUri('\n' + formatMarkdown([message])).length;
-  }
-
-  function buildOverflowNote({ textTrimmed, removedMediaCount, removedLinkCount, removedReference }) {
-    const parts = [];
-    if (textTrimmed) parts.push('正文已截断');
-    if (removedMediaCount > 0) parts.push(`省略${removedMediaCount}个媒体`);
-    if (removedLinkCount > 0) parts.push(`省略${removedLinkCount}条链接`);
-    if (removedReference) parts.push('引用已省略');
-    if (!parts.length) return '';
-    return `[内容过长，${parts.join('，')}]`;
-  }
-
-  function buildTruncatedText(baseText, maxLength, note) {
-    const safeBase = (baseText || '').trim();
-    if (!safeBase) return note || '';
-    if (maxLength <= 0) return note || '';
-    if (safeBase.length <= maxLength) {
-      return note ? `${safeBase}\n${note}` : safeBase;
-    }
-    const truncated = `${safeBase.slice(0, maxLength).trimEnd()}…`;
-    return note ? `${truncated}\n${note}` : truncated;
-  }
-
-  // 单条消息超限时，尽量降级成一个可归档版本，避免卡住后续“先归档再删除”的循环。
-  // 降级顺序：父级链接 → 引用链接 → 父级媒体 → 引用媒体 → 引用正文 → 父级正文 → 整块引用丢弃。
-  // 单条超长引用因此不会永久卡住整轮导出：最后总能退化成一条带原推文链接的最小记录。
-  function fitSingleMessageWithinLimit(message) {
-    const originalMedia = [...(message.media || [])];
-    const originalLinks = [...(message.extraLinks || [])];
-    const originalText = message.text || '';
-    const originalTranslatedText = message.translatedText || '';
-    const reference = message.referencedTweet || null;
-    const refMedia = [...(reference?.media || [])];
-    const refLinks = [...(reference?.extraLinks || [])];
-    const refText = reference?.text || '';
-    const refTranslatedText = reference?.translatedText || '';
-
-    let removedMediaCount = 0;
-    let removedLinkCount = 0;
-    let textTrimmed = false;
-    let textLimit = originalText.length;
-    let translatedTextLimit = originalTranslatedText.length;
-    let removedRefMediaCount = 0;
-    let removedRefLinkCount = 0;
-    let refTextTrimmed = false;
-    let refTextLimit = refText.length;
-    let refTranslatedTextLimit = refTranslatedText.length;
-    let referenceDropped = false;
-
-    function buildCandidate() {
-      const note = buildOverflowNote({
-        textTrimmed,
-        removedMediaCount,
-        removedLinkCount,
-        removedReference: referenceDropped,
-      });
-      const media = originalMedia.slice(0, originalMedia.length - removedMediaCount);
-      const extraLinks = originalLinks.slice(0, originalLinks.length - removedLinkCount);
-      const text = buildTruncatedText(originalText, textLimit, note);
-      const translatedText = originalTranslatedText
-        ? buildTruncatedText(originalTranslatedText, translatedTextLimit, '')
-        : '';
-      // 引用降到最小时只剩 header + 链接；再不行就整块丢弃
-      const referencedTweet = (!reference || referenceDropped)
-        ? null
-        : {
-          ...reference,
-          media: refMedia.slice(0, refMedia.length - removedRefMediaCount),
-          extraLinks: refLinks.slice(0, refLinks.length - removedRefLinkCount),
-          text: buildTruncatedText(refText, refTextLimit, buildOverflowNote({
-            textTrimmed: refTextTrimmed,
-            removedMediaCount: removedRefMediaCount,
-            removedLinkCount: removedRefLinkCount,
-          })),
-          translatedText: refTranslatedText
-            ? buildTruncatedText(refTranslatedText, refTranslatedTextLimit, '')
-            : '',
-          needsFetch: false,
-        };
-      return { ...message, media, extraLinks, text, translatedText, referencedTweet };
-    }
-
-    let candidate = buildCandidate();
-    if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
-
-    while (removedLinkCount < originalLinks.length) {
-      removedLinkCount++;
-      candidate = buildCandidate();
-      if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
-    }
-
-    while (removedRefLinkCount < refLinks.length) {
-      removedRefLinkCount++;
-      candidate = buildCandidate();
-      if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
-    }
-
-    while (removedMediaCount < originalMedia.length) {
-      removedMediaCount++;
-      candidate = buildCandidate();
-      if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
-    }
-
-    while (removedRefMediaCount < refMedia.length) {
-      removedRefMediaCount++;
-      candidate = buildCandidate();
-      if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
-    }
-
-    // 标志位只在真正缩短文本时置位：未进入循环说明正文本来就是完整的
-    if (refText || refTranslatedText) {
-      while (refTextLimit > 140 || refTranslatedTextLimit > 140) {
-        const nextRefTextLimit = Math.max(140, refTextLimit - 100);
-        const nextRefTranslatedLimit = Math.max(140, refTranslatedTextLimit - 100);
-        if (nextRefTextLimit === refTextLimit && nextRefTranslatedLimit === refTranslatedTextLimit) break;
-        refTextLimit = nextRefTextLimit;
-        refTranslatedTextLimit = nextRefTranslatedLimit;
-        refTextTrimmed = true;
-        candidate = buildCandidate();
-        if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
-      }
-    }
-
-    if (originalText || originalTranslatedText) {
-      while (textLimit > 280 || translatedTextLimit > 280) {
-        const nextTextLimit = Math.max(280, textLimit - 200);
-        const nextTranslatedLimit = Math.max(280, translatedTextLimit - 200);
-        if (nextTextLimit === textLimit && nextTranslatedLimit === translatedTextLimit) break;
-        textLimit = nextTextLimit;
-        translatedTextLimit = nextTranslatedLimit;
-        textTrimmed = true;
-        candidate = buildCandidate();
-        if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
-      }
-    }
-
-    if (reference) {
-      referenceDropped = true;
-      candidate = buildCandidate();
-      if (getSingleMessageUriLength(candidate) <= URI_SOFT_MAX) return candidate;
-    }
-
-    const minimalNote = message.url
-      ? '[内容过长，已截断，详见原推文链接]'
-      : '[内容过长，已截断]';
-    candidate = {
-      ...message,
-      media: [],
-      extraLinks: [],
-      referencedTweet: null,
-      text: minimalNote,
-      translatedText: '',
-    };
-    return getSingleMessageUriLength(candidate) <= URI_SOFT_MAX ? candidate : null;
-  }
-
   // 只选择“从前往后”能安全装进单次导出的消息前缀。
-  // 超限后立即停止，剩余消息留给下一轮导出，避免一次触发多次 URI 调用。
+  // 超限后的剩余消息由 buildExportQueue 继续排入延时队列，避免一次触发多次 URI 调用。
   function takeExportableMessagePrefix(messages) {
     const selected = [];
-    let truncatedCount = 0;
 
     for (const msg of messages) {
       const next = [...selected, msg];
@@ -1326,27 +1289,77 @@
         continue;
       }
 
+      // 只按完整消息打包：加入这条会超限，就把当前完整前缀交给本轮，
+      // 这条完整消息留到下一段，不能把单条消息切成不完整内容。
+      if (selected.length) break;
+
       const singleUri = buildObsidianUri('\n' + formatMarkdown([msg]));
-      if (!selected.length && singleUri.length > URI_SOFT_MAX) {
-        const fitted = fitSingleMessageWithinLimit(msg);
-        if (fitted) {
-          return {
-            selected: [fitted],
-            remaining: messages.slice(1),
-            blockedBySingleOversize: false,
-            truncatedCount: 1,
-          };
-        }
-        return { selected: [], remaining: messages, blockedBySingleOversize: true, truncatedCount: 0 };
+      if (singleUri.length <= URI_MAX) {
+        return {
+          selected: [msg],
+          remaining: messages.slice(1),
+          blockedBySingleOversize: false,
+        };
       }
-      break;
+
+      return {
+        selected: [],
+        remaining: messages,
+        blockedBySingleOversize: true,
+      };
     }
 
     return {
       selected,
       remaining: messages.slice(selected.length),
       blockedBySingleOversize: false,
-      truncatedCount,
+    };
+  }
+
+  function buildExportQueue(messages) {
+    const chunks = [];
+    const messageKeys = [];
+    const skippedOversizedKeys = [];
+    let remaining = messages;
+
+    while (remaining.length) {
+      const { selected, remaining: rest, blockedBySingleOversize } =
+        takeExportableMessagePrefix(remaining);
+      if (!selected.length) {
+        if (blockedBySingleOversize && remaining.length) {
+          skippedOversizedKeys.push(remaining[0].messageKey);
+          remaining = remaining.slice(1);
+          continue;
+        }
+        return {
+          chunks,
+          messageKeys,
+          remaining,
+          skippedOversizedKeys,
+        };
+      }
+
+      const uri = buildObsidianUri('\n' + formatMarkdown(selected));
+      if (uri.length > URI_MAX) {
+        skippedOversizedKeys.push(selected[0].messageKey);
+        remaining = rest;
+        continue;
+      }
+
+      chunks.push({
+        uri,
+        count: selected.length,
+        messageKeys: selected.map(m => m.messageKey),
+      });
+      messageKeys.push(...selected.map(m => m.messageKey));
+      remaining = rest;
+    }
+
+    return {
+      chunks,
+      messageKeys,
+      remaining: [],
+      skippedOversizedKeys,
     };
   }
 
@@ -1369,6 +1382,14 @@
 
     btn.textContent = '⏳ 抓取中...';
     btn.disabled = true;
+
+    const conversationKey = getCurrentConversationKey();
+    const pendingQueue = loadExportQueue(conversationKey);
+    if (pendingQueue && pendingQueue.nextIndex < pendingQueue.uris.length) {
+      resumePendingExportQueue(btn, deleteBtn);
+      setButtonStatus(btn, '⏳ 续发中', { resetTo: getExportButtonIdleLabel() });
+      return;
+    }
 
     // 书签页用 DOM 原始顺序（最新在前），DM 页按屏幕位置降序（底部最新在前）
     const freshMessages = (scraper === scrapeLoadedMessages ? sortMessagesForExport(scraper()) : scraper())
@@ -1413,8 +1434,8 @@
     // 已完成 oEmbed / t.co / 引用展开的纯数据结果落缓存，下次点击无需重复抓取
     saveExportCache(getCurrentConversationKey(), messages);
 
-    const { selected, remaining, blockedBySingleOversize, truncatedCount } = takeExportableMessagePrefix(messages);
-    if (!selected.length) {
+    const { chunks, messageKeys, remaining, skippedOversizedKeys } = buildExportQueue(messages);
+    if (!chunks.length) {
       if (deleteBtn && document.contains(deleteBtn)) syncDeleteGuard(deleteBtn);
       if (skippedDeletedTweetKeys.length > 0) {
         setButtonStatus(btn, `⏭️ 跳过失效 ${skippedDeletedTweetKeys.length}`, {
@@ -1424,30 +1445,33 @@
       }
       setButtonStatus(
         btn,
-        blockedBySingleOversize ? `⚠️ 首条超长>${URI_SOFT_MAX}` : '⚠️ 无可导出消息',
+        skippedOversizedKeys.length
+          ? `⚠️ 超长跳过${skippedOversizedKeys.length}`
+          : '⚠️ 无可导出消息',
         { resetTo: getExportButtonIdleLabel() }
       );
       return;
     }
 
-    const uri = buildObsidianUri('\n' + formatMarkdown(selected));
-    if (uri.length > URI_MAX) {
-      setButtonStatus(btn, `⚠️ 导出超限>${URI_MAX}`, { resetTo: getExportButtonIdleLabel() });
-      return;
-    }
-
-    btn.textContent = `⏳ 导出 ${selected.length} 条...`;
-    saveLastExportRecord(selected.map(m => m.messageKey), uri);
+    const dispatchChunks = orderChunksForWriteMode(chunks);
+    const dispatchUris = dispatchChunks.map(chunk => chunk.uri);
+    const dispatchMessageKeys = dispatchChunks.map(chunk => chunk.messageKeys);
+    const totalCount = new Set(messageKeys).size;
+    btn.textContent = `⏳ 导出 ${totalCount} 条...`;
+    saveLastExportRecord(messageKeys, dispatchUris, dispatchMessageKeys);
     // 先落库再导航：window.location.href 赋值后页面可能立即卸载/被系统提示打断，
     // 必须保证已导出状态在导航发起前写入 localStorage，删除安全门禁才可靠
-    markMessagesExported(selected.map(m => m.messageKey));
-    window.location.href = uri;
+    markMessagesExported(messageKeys);
+    const queue = { uris: dispatchUris, messageKeys: dispatchMessageKeys, nextIndex: 0, at: Date.now() };
+    saveExportQueue(conversationKey, queue);
+    runExportQueue(conversationKey, queue, btn, deleteBtn);
 
     setTimeout(() => {
       if (deleteBtn && document.contains(deleteBtn)) syncDeleteGuard(deleteBtn);
-      const summary = [`归档${selected.length}`];
-      if (truncatedCount > 0) summary.push(`精简${truncatedCount}`);
+      const summary = [`归档${totalCount}`];
       if (skippedDeletedTweetKeys.length > 0) summary.push(`失效${skippedDeletedTweetKeys.length}`);
+      if (skippedOversizedKeys.length > 0) summary.push(`超长跳过${skippedOversizedKeys.length}`);
+      if (chunks.length > 1) summary.push(`续发${chunks.length - 1}`);
       if (remaining.length > 0) summary.push(`剩余${remaining.length}`);
       setButtonStatus(btn, `✅ ${summary.join(' ')}`, {
         resetTo: getExportButtonIdleLabel(),
@@ -1792,9 +1816,10 @@
     if (resendItem) {
       resetRecoveryMenuItem(resendItem);
       resendItem.disabled = !loadLastExportRecord(getCurrentConversationKey());
+      const lastRecord = resendItem.disabled ? null : loadLastExportRecord(getCurrentConversationKey());
       resendItem.title = resendItem.disabled
         ? '暂无上次导出记录'
-        : '重新派发上次生成的 obsidian://advanced-uri';
+        : `重新派发上次导出的 ${lastRecord.uris.length} 段内容`;
     }
     const unmarkItem = menu.querySelector('[data-action="unmark"]');
     if (unmarkItem) resetRecoveryMenuItem(unmarkItem);
@@ -1818,12 +1843,27 @@
     const recoveryBtn = document.getElementById('obsidian-recovery-btn');
 
     if (action === 'resend') {
-      const record = loadLastExportRecord(getCurrentConversationKey());
-      if (!record?.uri) {
+      const conversationKey = getCurrentConversationKey();
+      const activeQueue = loadExportQueue(conversationKey);
+      if (exportQueueTimer || (activeQueue && activeQueue.nextIndex < activeQueue.uris.length)) {
+        setButtonStatus(recoveryBtn, '⏳ 队列派发中', { resetTo: getRecoveryButtonIdleLabel() });
+        return;
+      }
+      const record = loadLastExportRecord(conversationKey);
+      if (!record?.uris?.length) {
         setButtonStatus(recoveryBtn, '⚪ 无上次导出', { resetTo: getRecoveryButtonIdleLabel() });
         return;
       }
-      window.location.href = record.uri;
+      const queue = {
+        uris: record.uris,
+        messageKeys: record.messageKeysByUri.length === record.uris.length
+          ? record.messageKeysByUri
+          : record.uris.map(() => record.messageKeys),
+        nextIndex: 0,
+        at: Date.now(),
+      };
+      saveExportQueue(conversationKey, queue);
+      runExportQueue(conversationKey, queue, recoveryBtn, null);
       setButtonStatus(recoveryBtn, '✅', { resetTo: getRecoveryButtonIdleLabel() });
       return;
     }
@@ -2054,6 +2094,7 @@
       }
       syncDeleteGuard(existingDeleteBtn);
       updateExportedVisuals();
+      resumePendingExportQueue(existingExportBtn, existingDeleteBtn);
       return;
     }
     existingExportBtn?.remove();
@@ -2106,6 +2147,7 @@
       container.appendChild(deleteBtn);
       container.appendChild(recoveryBtn);
       updateExportedVisuals();
+      resumePendingExportQueue(exportBtn, deleteBtn);
       return;
     }
 
@@ -2146,6 +2188,7 @@
     container.insertBefore(exportBtn, deleteBtn);
     container.appendChild(recoveryBtn);
     updateExportedVisuals();
+    resumePendingExportQueue(exportBtn, deleteBtn);
   }
 
   // ─── SPA 路由处理 ────────────────────────────────────────────────────────────
